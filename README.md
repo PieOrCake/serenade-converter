@@ -4,6 +4,8 @@ A GUI tool for converting MIDI files to AHK (AutoHotkey) scripts compatible with
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue) ![PyQt6](https://img.shields.io/badge/GUI-PyQt6-green) ![License](https://img.shields.io/badge/License-GPLv3-orange)
 
+![Screenshot](wiki/screenshots/main_window_context_menu.png)
+
 ## Features
 
 - **Piano Roll Editor** — visual note editing with drag, draw, resize, copy/paste, undo/redo
