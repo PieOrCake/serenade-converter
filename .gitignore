@@ -1,0 +1,27 @@
+# Build artifacts
+*.AppImage
+*.spec
+build/
+dist/
+__pycache__/
+AppDir/usr/bin/serenade-midi-converter
+AppDir/usr/plugins/
+
+# Virtual environment
+.venv/
+
+# MuseScore helper (private)
+.musescore*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Session state
+.serenade_session.json
