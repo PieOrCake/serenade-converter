@@ -17,16 +17,25 @@ A GUI tool for converting MIDI files to AHK (AutoHotkey) scripts compatible with
 - **Batch conversion** — convert multiple MIDI files at once
 - **Song submission** — submit your arrangements to the community song index
 
-## Download
+## Installation
 
-Grab the latest AppImage from the [Releases](https://github.com/PieOrCake/serenade-converter/releases) page.
+### Using an AppImage Manager (recommended)
+1. Install [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever) from Flathub
+2. Download the latest `.AppImage` from [Releases](https://github.com/PieOrCake/serenade-converter/releases)
+3. Right-click the downloaded file and select Open With → Gear Lever
+
+Gear Lever will integrate the app into your desktop — no terminal needed.
+
+### Manual (terminal)
+Download the latest `.AppImage` from [Releases](https://github.com/PieOrCake/serenade-converter/releases), then:
 
 ```bash
 chmod +x Serenade_Music_Converter-x86_64.AppImage
 ./Serenade_Music_Converter-x86_64.AppImage
 ```
 
-No installation required — the AppImage bundles everything.
+### Windows
+Download `Serenade.Music.Converter.exe` from [Releases](https://github.com/PieOrCake/serenade-converter/releases) and run it directly. No installation required.
 
 ## Running from Source
 
