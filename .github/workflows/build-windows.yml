@@ -2,7 +2,15 @@ name: Build Windows Executable
 
 on:
   release:
-    types: [created]
+    types: [created, published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach the build to'
+        required: true
+
+permissions:
+  contents: write
 
 jobs:
   build-windows:
@@ -26,4 +34,5 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.event.release.tag_name }}
           files: dist/Serenade Music Converter.exe
