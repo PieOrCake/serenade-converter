@@ -91,3 +91,14 @@ This builds inside an Ubuntu 22.04 container using PyInstaller, then packages th
 ## License
 
 This project is licensed under the [GNU General Public License v3.0](LICENSE).
+
+## Third-Party Dependencies
+
+| Library | License | Link |
+|---|---|---|
+| [PyQt6](https://pypi.org/project/PyQt6/) | GPL v3 | [Riverbank Computing](https://riverbankcomputing.com/software/pyqt/) |
+| [Qt 6](https://www.qt.io/) | LGPL v3 / GPL v3 | [qt.io](https://www.qt.io/licensing/) |
+| [mido](https://pypi.org/project/mido/) | MIT | [GitHub](https://github.com/mido/mido) |
+| [pygame](https://pypi.org/project/pygame/) | LGPL v2.1 | [pygame.org](https://www.pygame.org/) |
+| [NumPy](https://pypi.org/project/numpy/) | BSD 3-Clause | [numpy.org](https://numpy.org/) |
+| [PyInstaller](https://pypi.org/project/pyinstaller/) | GPL v2 (with bootloader exception) | [GitHub](https://github.com/pyinstaller/pyinstaller) |
