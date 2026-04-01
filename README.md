@@ -37,56 +37,18 @@ chmod +x Serenade_Music_Converter-x86_64.AppImage
 ### Windows
 Download `Serenade.Music.Converter.exe` from [Releases](https://github.com/PieOrCake/serenade-converter/releases) and run it directly. No installation required.
 
-## Running from Source
+## Documentation
 
-```bash
-# Clone the repo
-git clone https://github.com/PieOrCake/serenade-converter.git
-cd serenade-converter
+See the [Wiki](https://github.com/PieOrCake/serenade-converter/wiki) for the full user guide:
 
-# Create a virtual environment and install dependencies
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# Run
-python3 midi2ahk.py
-```
-
-### Requirements
-
-- Python 3.10+
-- PyQt6
-- mido
-- numpy
-- pygame
-
-## Building the AppImage
-
-Requires [Podman](https://podman.io/) (or Docker with minor script edits).
-
-```bash
-./build-appimage.sh
-```
-
-This builds inside an Ubuntu 22.04 container using PyInstaller, then packages the result as an AppImage. The output is `Serenade_Music_Converter-x86_64.AppImage`.
-
-## Keyboard Shortcuts
-
-| Shortcut | Action |
-|---|---|
-| Ctrl+O | Import file |
-| Ctrl+S | Save AHK |
-| Ctrl+Z / Ctrl+Y | Undo / Redo |
-| Ctrl+C / Ctrl+V | Copy / Paste notes |
-| Ctrl+A | Select all notes |
-| Del | Delete selected notes |
-| Ctrl+D | Toggle draw mode |
-| Ctrl+= / Ctrl+- | Zoom in / out |
-| Ctrl+Shift+Click | Toggle note simplification (on simplified tracks) |
-| Mouse wheel | Scroll vertically |
-| Shift+Wheel | Scroll horizontally |
-| Ctrl+Wheel | Zoom |
+- [Getting Started](https://github.com/PieOrCake/serenade-converter/wiki/Getting-Started)
+- [Piano Roll Editing](https://github.com/PieOrCake/serenade-converter/wiki/Piano-Roll-Editing)
+- [Track Management](https://github.com/PieOrCake/serenade-converter/wiki/Track-Management)
+- [Chord Simplification](https://github.com/PieOrCake/serenade-converter/wiki/Chord-Simplification)
+- [Conversion Settings](https://github.com/PieOrCake/serenade-converter/wiki/Conversion-Settings)
+- [Playback](https://github.com/PieOrCake/serenade-converter/wiki/Playback)
+- [Keyboard Shortcuts](https://github.com/PieOrCake/serenade-converter/wiki/Keyboard-Shortcuts)
+- [Building from Source](https://github.com/PieOrCake/serenade-converter/wiki/Building-from-Source)
 
 ## License
 
