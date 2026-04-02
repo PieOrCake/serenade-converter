@@ -13,11 +13,15 @@ A GUI tool for converting MIDI files to AHK (AutoHotkey) scripts compatible with
 - **Per-track simplification** — reduce chord complexity by keeping only treble + bass notes (✂)
 - **GW2 instrument mapping** — supports all GW2 instruments (Harp, Lute, Horn, Bell, Flute, Bass, etc.)
 - **Chord mode** — detects major/minor triads and substitutes GW2 chord keypresses
-- **Smart octave detection** — automatically finds the best transpose and octave settings
-- **Audio preview** — listen to your arrangement with synthesized playback
+- **Smart octave detection** — auto-transpose minimizes octave changes; optional octave smoothing
+- **Octave settle delays** — 60ms per-step delays in AHK output for reliable GW2 octave switching
+- **Audio preview** — Play, Play Here, Stop, and loop controls with synthesized playback
+- **AHK import** — load existing AHK scripts back into the piano roll for editing
 - **MusicXML import/export** — interoperate with notation software
+- **Drag & drop** — drop MIDI, MusicXML, or AHK files onto the window to load
 - **Batch conversion** — convert multiple MIDI files at once
 - **Song submission** — submit your arrangements to the community song index
+- **Dark / Light themes** — switchable UI themes
 
 ## Installation
 

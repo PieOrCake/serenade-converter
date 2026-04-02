@@ -13,7 +13,7 @@ GW2 Piano mapping (C Major instruments):
     GW2 piano has 3 octaves (low/mid/high).
 """
 
-__version__ = '1.0.0'
+__version__ = '1.1.0'
 
 import sys
 import webbrowser
@@ -192,7 +192,9 @@ def extract_midi_metadata(mid):
 
 
 def find_best_transpose(notes_with_times):
-    """Find the transposition (0-11 semitones) that maximizes white-key usage.
+    """Find the transposition (0-11 semitones) that minimizes octave boundary
+    crossings between consecutive notes.  White-key percentage is used only
+    as a tiebreaker when two shifts produce the same number of crossings.
 
     Returns (best_shift, white_pct) where best_shift is semitones to add.
     """
@@ -202,13 +204,22 @@ def find_best_transpose(notes_with_times):
     midi_notes = [n for _, n, _ in notes_with_times]
     total = len(midi_notes)
     best_shift = 0
+    best_crossings = total  # worst case
     best_white = 0
 
     for shift in range(12):
+        crossings = 0
+        for i in range(total - 1):
+            if (midi_notes[i] + shift) // 12 != (midi_notes[i + 1] + shift) // 12:
+                crossings += 1
+
         white = sum(1 for n in midi_notes if (n + shift) % 12 in WHITE_KEY_SEMITONES)
-        if white > best_white:
-            best_white = white
+
+        # Primary: fewest crossings.  Tiebreaker: most white keys.
+        if crossings < best_crossings or (crossings == best_crossings and white > best_white):
+            best_crossings = crossings
             best_shift = shift
+            best_white = white
 
     return best_shift, (best_white / total) * 100.0
 
@@ -584,7 +595,7 @@ def extract_musicxml_metadata(root):
     return meta
 
 
-def convert(midi_file, output_file, track_indices=None, title=None, author=None, transpose=None, base_octave=None, chord_window_ms=5, notes_override=None, use_chords=False, instrument=None):
+def convert(midi_file, output_file, track_indices=None, title=None, author=None, transpose=None, base_octave=None, chord_window_ms=5, notes_override=None, use_chords=False, instrument=None, smooth_octaves=False):
     """Convert a MIDI file to a GW2 AHK script. Returns (success, log_lines).
 
     track_indices: list of track indices, or None for all tracks merged.
@@ -593,6 +604,7 @@ def convert(midi_file, output_file, track_indices=None, title=None, author=None,
     chord_window_ms: max gap (ms) between notes to group as a chord.
         Default 5 (nearly simultaneous). Higher values collapse arpeggios.
     use_chords: if True, substitute detected triads with GW2 chord mode keypresses.
+    smooth_octaves: if True, flatten short octave excursions in fast passages.
     """
     log = []
     if notes_override is not None:
@@ -615,7 +627,7 @@ def convert(midi_file, output_file, track_indices=None, title=None, author=None,
 
     log.append(f"Note events: {len(notes)}")
 
-    # Auto-transpose to maximize white-key (natural note) usage
+    # Auto-transpose to minimize octave boundary crossings
     notes_3 = [(t, n, v) for t, n, v, _m in notes]  # 3-tuple view for helpers
     if transpose is None:
         transpose, white_pct = find_best_transpose(notes_3)
@@ -631,6 +643,18 @@ def convert(midi_file, output_file, track_indices=None, title=None, author=None,
 
     if base_octave is not None:
         base_midi = base_octave
+        in_range = sum(1 for _, n, _, _m in notes if base_midi <= n < base_midi + 36)
+        total = len(notes)
+    elif instrument:
+        # Use the selected instrument's base octave so GW2 octave mapping
+        # matches the range lines shown in the piano roll.
+        base_midi = None
+        for inst_name, _, inst_low, _ in GW2_INSTRUMENTS:
+            if inst_name == instrument:
+                base_midi = inst_low
+                break
+        if base_midi is None:
+            base_midi, _, _ = find_best_base_octave(notes_3)
         in_range = sum(1 for _, n, _, _m in notes if base_midi <= n < base_midi + 36)
         total = len(notes)
     else:
@@ -695,65 +719,79 @@ def convert(midi_file, output_file, track_indices=None, title=None, author=None,
             target_octave = max(octave_counts, key=octave_counts.get)
         group_data.append((group, gw2_notes, target_octave))
 
-    # Second pass: smooth octave sequence using hybrid time + run-length.
+    # Second pass (optional): smooth octave sequence using hybrid time + run-length.
     # In fast passages (short gaps), only switch octave if we stay in the
     # new octave for MIN_RUN groups. In slow passages (long gaps), allow
     # octave changes freely since there's enough time for the switch.
     MIN_RUN = 4       # min consecutive groups in fast passages
     SLOW_GAP_MS = 250  # gaps >= this are "slow" — always allow changes
     octave_changes_saved = 0
-    # Start smoothing from the first group's actual octave
-    first_oct = GW2_MID
-    for _, notes_check, oct_check in group_data:
-        if notes_check:
-            first_oct = oct_check
-            break
-    current_smooth_oct = first_oct
-    i = 0
-    while i < len(group_data):
-        grp, notes, oct = group_data[i]
-        if not notes:
-            i += 1
-            continue
-        if oct == current_smooth_oct:
-            i += 1
-            continue
+    if smooth_octaves:
+        # Start smoothing from the first group's actual octave
+        first_oct = GW2_MID
+        for _, notes_check, oct_check in group_data:
+            if notes_check:
+                first_oct = oct_check
+                break
+        current_smooth_oct = first_oct
+        def _group_has_melody(gd):
+            """Return True if a group_data entry contains any melody notes."""
+            return any(is_mel for _, _, _, is_mel in gd[1])
 
-        # Check timing gap before this group
-        gap_ms = 0
-        if i > 0:
-            gap_ms = grp[0][0] - group_data[i - 1][0][0][0]
+        i = 0
+        while i < len(group_data):
+            grp, notes, oct = group_data[i]
+            if not notes:
+                i += 1
+                continue
+            if oct == current_smooth_oct:
+                i += 1
+                continue
 
-        # Slow passage — allow octave change regardless of run length
-        if gap_ms >= SLOW_GAP_MS:
-            current_smooth_oct = oct
-            i += 1
-            continue
+            # Never smooth groups that contain melody notes — the melody
+            # must always play at its correct octave.
+            if has_melody and _group_has_melody(group_data[i]):
+                current_smooth_oct = oct
+                i += 1
+                continue
 
-        # Fast passage — require minimum run length
-        run_length = 0
-        for j in range(i, len(group_data)):
-            if group_data[j][1]:  # has notes
-                if group_data[j][2] == oct:
-                    run_length += 1
-                else:
-                    break
-        if run_length >= MIN_RUN:
-            current_smooth_oct = oct
-            i += 1
-        else:
-            # Flatten this short run to current octave
+            # Check timing gap before this group
+            gap_ms = 0
+            if i > 0:
+                gap_ms = grp[0][0] - group_data[i - 1][0][0][0]
+
+            # Slow passage — allow octave change regardless of run length
+            if gap_ms >= SLOW_GAP_MS:
+                current_smooth_oct = oct
+                i += 1
+                continue
+
+            # Fast passage — require minimum run length
+            run_length = 0
             for j in range(i, len(group_data)):
-                if group_data[j][1]:
+                if group_data[j][1]:  # has notes
                     if group_data[j][2] == oct:
-                        group_data[j] = (group_data[j][0], group_data[j][1], current_smooth_oct)
-                        octave_changes_saved += 1
+                        run_length += 1
                     else:
                         break
-            i += 1
+            if run_length >= MIN_RUN:
+                current_smooth_oct = oct
+                i += 1
+            else:
+                # Flatten this short run to current octave, but skip melody groups
+                for j in range(i, len(group_data)):
+                    if group_data[j][1]:
+                        if group_data[j][2] == oct:
+                            if has_melody and _group_has_melody(group_data[j]):
+                                break  # don't flatten melody groups
+                            group_data[j] = (group_data[j][0], group_data[j][1], current_smooth_oct)
+                            octave_changes_saved += 1
+                        else:
+                            break
+                i += 1
 
-    if octave_changes_saved > 0:
-        log.append(f"Octave smoothing: flattened {octave_changes_saved} short octave excursions")
+        if octave_changes_saved > 0:
+            log.append(f"Octave smoothing: flattened {octave_changes_saved} short octave excursions")
 
     # Count actual octave changes
     octave_change_count = 0
@@ -769,12 +807,31 @@ def convert(midi_file, output_file, track_indices=None, title=None, author=None,
     last_time_ms = 0.0
     chord_subs = 0
 
+    OCTAVE_SWITCH_MS = 60  # per-step delay for GW2 to process octave change
+
     for group, gw2_notes, target_octave in group_data:
         group_time = group[0][0]
         gap_ms = group_time - last_time_ms
 
-        if gap_ms > 1:
-            lines.append(f'Sleep, {int(round(gap_ms))}')
+        # Compute how many octave steps are needed for this group
+        oct_steps = 0
+        if gw2_notes:
+            triad = None
+            if use_chords and len(gw2_notes) >= 3:
+                midi_pitches = [n for _, n, _, _m in group]
+                triad = detect_triad(midi_pitches)
+            if triad:
+                _rs, _ct = triad
+                needed = GW2_MODE_MAJOR if _ct == 'major' else GW2_MODE_MINOR
+            else:
+                needed = target_octave
+            oct_steps = abs(needed - current_mode)
+
+        # Emit sleep with octave cost absorbed
+        oct_cost = oct_steps * OCTAVE_SWITCH_MS
+        rest_ms = gap_ms - oct_cost
+        if rest_ms > 1:
+            lines.append(f'Sleep, {int(round(rest_ms))}')
 
         if not gw2_notes:
             last_time_ms = group_time
@@ -794,9 +851,11 @@ def convert(midi_file, output_file, track_indices=None, title=None, author=None,
                 if target_mode > current_mode:
                     for _ in range(target_mode - current_mode):
                         lines.append('SendInput {Numpad0}')
+                        lines.append(f'Sleep, {OCTAVE_SWITCH_MS}')
                 else:
                     for _ in range(current_mode - target_mode):
                         lines.append('SendInput {Numpad9}')
+                        lines.append(f'Sleep, {OCTAVE_SWITCH_MS}')
                 current_mode = target_mode
             # Send root key
             key_type, key_num = NOTE_MAP[root_semi]
@@ -809,9 +868,11 @@ def convert(midi_file, output_file, track_indices=None, title=None, author=None,
                 if target_mode_oct > current_mode:
                     for _ in range(target_mode_oct - current_mode):
                         lines.append('SendInput {Numpad0}')
+                        lines.append(f'Sleep, {OCTAVE_SWITCH_MS}')
                 else:
                     for _ in range(current_mode - target_mode_oct):
                         lines.append('SendInput {Numpad9}')
+                        lines.append(f'Sleep, {OCTAVE_SWITCH_MS}')
                 current_mode = target_mode_oct
 
             # Prioritise melody notes, then sort low-to-high
@@ -1308,8 +1369,8 @@ def parse_ahk_to_notes(ahk_path):
     Key mapping (GW2 default):
       Numpad 1-8 -> C,D,E,F,G,A,B,C'  (semitone offsets: 0,2,4,5,7,9,11,12)
       F1-F5      -> C#,D#,F#,G#,A#     (semitone offsets: 1,3,6,8,10)
-      Numpad 9   -> octave up
-      Numpad 0   -> octave down
+      Numpad 9   -> octave down
+      Numpad 0   -> octave up
     Mid octave base = MIDI 60 (C4).
     """
     import re as _re
@@ -1343,17 +1404,17 @@ def parse_ahk_to_notes(ahk_path):
         if m:
             digit = int(m.group(1))
             if digit == 9:
-                return OCTAVE_UP
-            if digit == 0:
                 return OCTAVE_DOWN
+            if digit == 0:
+                return OCTAVE_UP
             return digit  # 1-8
         # Bare digit
         if len(c) == 1 and c.isdigit():
             digit = int(c)
             if digit == 9:
-                return OCTAVE_UP
-            if digit == 0:
                 return OCTAVE_DOWN
+            if digit == 0:
+                return OCTAVE_UP
             return digit
         # F-keys (sharps)
         m = _re.match(r'f(\d+)', c)
@@ -2813,6 +2874,30 @@ class MainWindow(QMainWindow):
         self._mode_btn.toggled.connect(self._on_draw_btn_toggled)
         toolbar2.addWidget(self._mode_btn)
 
+        # ☕ Buy me a coffee button with gentle pulsing burnt orange glow
+        self._coffee_btn = QPushButton("☕ Buy me a coffee")
+        self._coffee_btn.setMinimumHeight(30)
+        self._coffee_btn.setFixedWidth(160)
+        self._coffee_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._coffee_btn.setToolTip("Support development on Ko-fi")
+        self._coffee_btn.clicked.connect(lambda: self._open_url("https://ko-fi.com/pieorcake"))
+        self._coffee_pulse_phase = 0.0
+        self._coffee_pulse_count = 0  # pulses remaining in current burst
+        self._coffee_idle_style = (
+            "QPushButton { background-color: #2a3a4a; border: 2px solid #4a6a8a; "
+            "border-radius: 4px; font-weight: bold; padding: 2px 8px; }"
+            "QPushButton:hover { background-color: #3a4a5a; }")
+        self._coffee_btn.setStyleSheet(self._coffee_idle_style)
+        # Animation timer (runs only during pulse bursts)
+        self._coffee_anim_timer = QTimer(self)
+        self._coffee_anim_timer.timeout.connect(self._pulse_coffee_btn)
+        # Schedule timer (fires to start a burst)
+        self._coffee_schedule_timer = QTimer(self)
+        self._coffee_schedule_timer.setSingleShot(True)
+        self._coffee_schedule_timer.timeout.connect(self._start_coffee_burst)
+        self._schedule_next_coffee_burst()
+        toolbar2.addWidget(self._coffee_btn)
+
         # Hidden dummy widgets for enable/disable compatibility
         self.convert_btn = QPushButton(); self.convert_btn.hide()
         self.export_xml_btn = QPushButton(); self.export_xml_btn.hide()
@@ -2863,7 +2948,7 @@ class MainWindow(QMainWindow):
 
         settings_layout.addWidget(QLabel("Transpose:"))
         self.transpose_combo = QComboBox()
-        self.transpose_combo.addItem("Auto (maximize white keys)", None)
+        self.transpose_combo.addItem("Auto (minimize octave changes)", None)
         for i in range(12):
             self.transpose_combo.addItem(f"+{i} semitones" if i else "None (keep original)", i)
         settings_layout.addWidget(self.transpose_combo)
@@ -2881,6 +2966,13 @@ class MainWindow(QMainWindow):
                                        "GW2's built-in chord keypresses for better sound.")
         self.use_chords_cb.setChecked(False)
         settings_layout.addWidget(self.use_chords_cb)
+
+        self.smooth_octaves_cb = QCheckBox("Smooth octave changes")
+        self.smooth_octaves_cb.setToolTip("Flatten short octave excursions in fast passages.\n"
+                                           "May improve simple melodies but can cause wrong\n"
+                                           "pitches in complex arrangements.")
+        self.smooth_octaves_cb.setChecked(False)
+        settings_layout.addWidget(self.smooth_octaves_cb)
 
         left_layout.addWidget(settings_group)
 
@@ -2908,6 +3000,14 @@ class MainWindow(QMainWindow):
         self.play_btn.setEnabled(False)
         self.play_btn.clicked.connect(self._playback_toggle)
         transport.addWidget(self.play_btn)
+
+        self.play_here_btn = QPushButton("▶ Here")
+        self.play_here_btn.setMinimumHeight(30)
+        self.play_here_btn.setFixedWidth(80)
+        self.play_here_btn.setEnabled(False)
+        self.play_here_btn.setToolTip("Play from the current view position")
+        self.play_here_btn.clicked.connect(self._playback_from_here)
+        transport.addWidget(self.play_here_btn)
 
         self.stop_btn = QPushButton("■ Stop")
         self.stop_btn.setMinimumHeight(30)
@@ -3028,6 +3128,7 @@ class MainWindow(QMainWindow):
         self.piano_roll.setNotes(self._pr_notes, self._pr_tracks, bpm)
         self._populate_track_list()
         self.play_btn.setEnabled(bool(self._pr_notes))
+        self.play_here_btn.setEnabled(bool(self._pr_notes))
 
     def _populate_track_list(self):
         """Populate the track checkbox list from piano roll track info."""
@@ -3239,6 +3340,7 @@ class MainWindow(QMainWindow):
 
         self._populate_track_list()
         self.play_btn.setEnabled(True)
+        self.play_here_btn.setEnabled(True)
         self._enable_export(ahk=True, xml=False, submit=True)
 
         nn = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
@@ -3280,7 +3382,11 @@ class MainWindow(QMainWindow):
             layout.addWidget(icon_label)
         text_label = QLabel(
             f"<h3>Serenade Music Converter v{__version__}</h3>"
-            "<p>Convert MIDI, MusicXML, and AHK files for GW2 instrument playback.</p>"
+            "<p>Convert MIDI, MusicXML, and AHK files into GW2-compatible<br>"
+            "instrument scripts with a full-featured piano roll editor.</p>"
+            "<p><b>Features:</b> Multi-track editing, per-track simplify,<br>"
+            "melody priority, auto-transpose, GW2 chord mode,<br>"
+            "octave smoothing, MIDI playback preview, drag &amp; drop.</p>"
             "<p>Licensed under the <b>GNU General Public License v3.0</b> (GPL-3.0).<br>"
             "This is free software; you are free to change and redistribute it.<br>"
             "There is NO WARRANTY, to the extent permitted by law.</p>"
@@ -3360,24 +3466,89 @@ class MainWindow(QMainWindow):
     def _show_shortcuts(self):
         """Show keyboard shortcuts dialog."""
         QMessageBox.information(self, "Keyboard Shortcuts",
-            "Scroll: Mouse wheel\n"
-            "Zoom: Ctrl + Mouse wheel\n"
-            "Horizontal scroll: Shift + Mouse wheel\n"
-            "Select notes: Click / Drag\n"
-            "Multi-select: Ctrl + Click\n"
-            "Delete selected: Del key\n"
-            "Select all: Ctrl+A\n"
+            "FILE\n"
+            "Import file: Ctrl+O\n"
+            "Save AHK: Ctrl+S\n"
+            "Drag file onto window: Load file\n\n"
+            "EDIT\n"
             "Undo: Ctrl+Z\n"
             "Redo: Ctrl+Y / Ctrl+Shift+Z\n"
             "Copy: Ctrl+C\n"
             "Paste: Ctrl+V\n"
+            "Select all: Ctrl+A\n"
+            "Delete selected: Del\n\n"
+            "VIEW\n"
+            "Draw mode: Ctrl+D\n"
             "Zoom in: Ctrl+= / Ctrl+wheel up\n"
             "Zoom out: Ctrl+- / Ctrl+wheel down\n"
-            "Draw mode: Ctrl+D\n\n"
+            "Scroll: Mouse wheel\n"
+            "Horizontal scroll: Shift + Mouse wheel\n\n"
+            "PIANO ROLL\n"
+            "Select notes: Click / Drag box\n"
+            "Multi-select: Ctrl+Click\n"
+            "Toggle simplified: Ctrl+Shift+Click (on simplified tracks)\n"
             "Right-click note: Delete note\n"
             "Right-click ruler: Trim menu\n"
-            "Drag note edge: Resize note\n"
-            "Drag file onto window: Load file")
+            "Drag note edge: Resize note\n\n"
+            "TRACK LIST (right-click)\n"
+            "Set as Melody / Clear Melody\n"
+            "Simplify (treble + bass) / Clear Simplify\n"
+            "Octave Up / Down, Clamp to Octave\n"
+            "Smart Octave Assignment\n"
+            "Split by Pitch, Merge Checked Tracks\n"
+            "Select All Notes, Delete Track Notes")
+
+    def _schedule_next_coffee_burst(self):
+        """Schedule the next pulse burst at a random interval (10-30 minutes)."""
+        import random
+        delay_ms = random.randint(10 * 60 * 1000, 30 * 60 * 1000)
+        self._coffee_schedule_timer.start(delay_ms)
+
+    def _start_coffee_burst(self):
+        """Start a 3-pulse burst animation."""
+        self._coffee_pulse_phase = 0.0
+        self._coffee_pulse_count = 3
+        self._coffee_anim_timer.start(50)
+
+    def _pulse_coffee_btn(self):
+        """Animate one tick of the pulse burst."""
+        import math
+        self._coffee_pulse_phase += 0.12
+        t = (math.sin(self._coffee_pulse_phase) + 1.0) / 2.0  # 0..1
+        # Check if we completed a full sine cycle (crossed zero going positive)
+        if self._coffee_pulse_phase >= self._coffee_pulse_count * 2 * math.pi:
+            self._coffee_anim_timer.stop()
+            self._coffee_btn.setStyleSheet(self._coffee_idle_style)
+            self._schedule_next_coffee_burst()
+            return
+        # Normal: bg #2a3a4a (42,58,74), border #4a6a8a (74,106,138), text #c8c8c8 (200,200,200)
+        # Target: bg #5a3018 (90,48,24), border #cc7030 (204,112,48), text #e8a050 (232,160,80)
+        def _lerp(a, b): return int(a + t * (b - a))
+        bgr, bgg, bgb = _lerp(42, 90), _lerp(58, 48), _lerp(74, 24)
+        bdr, bdg, bdb = _lerp(74, 204), _lerp(106, 112), _lerp(138, 48)
+        txr, txg, txb = _lerp(200, 232), _lerp(200, 160), _lerp(200, 80)
+        self._coffee_btn.setStyleSheet(
+            f"QPushButton {{ background-color: rgb({bgr},{bgg},{bgb}); "
+            f"border: 2px solid rgb({bdr},{bdg},{bdb}); border-radius: 4px; "
+            f"font-weight: bold; padding: 2px 8px; color: rgb({txr},{txg},{txb}); }}"
+            f"QPushButton:hover {{ background-color: rgb({min(255,bgr+30)},{min(255,bgg+20)},{min(255,bgb+10)}); }}")
+
+    def _open_url(self, url):
+        """Open a URL in the system browser, handling AppImage environment."""
+        import subprocess, platform
+        try:
+            if platform.system() == 'Darwin':
+                subprocess.Popen(['open', url])
+            elif platform.system() == 'Windows':
+                os.startfile(url)
+            else:
+                env = dict(os.environ)
+                for key in ('LD_LIBRARY_PATH', 'LD_PRELOAD'):
+                    env.pop(key, None)
+                subprocess.Popen(['xdg-open', url], env=env)
+        except Exception:
+            import webbrowser
+            webbrowser.open(url)
 
     def _on_draw_btn_toggled(self, checked):
         """Sync draw mode between toolbar button and menu action."""
@@ -3443,6 +3614,7 @@ class MainWindow(QMainWindow):
                 self.tracks_group.setEnabled(False)
                 self._populate_track_list()
                 self.play_btn.setEnabled(bool(self._pr_notes))
+                self.play_here_btn.setEnabled(bool(self._pr_notes))
                 if title:
                     self.title_edit.setText(title)
                 if author:
@@ -3700,7 +3872,8 @@ class MainWindow(QMainWindow):
                                          transpose_data, chord_window_ms=chord_window,
                                          notes_override=active_notes,
                                          use_chords=self.use_chords_cb.isChecked(),
-                                         instrument=inst_name)
+                                         instrument=inst_name,
+                                         smooth_octaves=self.smooth_octaves_cb.isChecked())
         elif self.file_type == "musicxml" and self.xml_root is not None:
             xml_notes = extract_notes_musicxml(self.xml_root, None)
             inst_data = self.instrument_combo.currentData()
@@ -3709,14 +3882,16 @@ class MainWindow(QMainWindow):
                                          transpose_data, chord_window_ms=chord_window,
                                          notes_override=xml_notes,
                                          use_chords=self.use_chords_cb.isChecked(),
-                                         instrument=inst_name)
+                                         instrument=inst_name,
+                                         smooth_octaves=self.smooth_octaves_cb.isChecked())
         else:
             inst_data = self.instrument_combo.currentData()
             inst_name = inst_data[0] if inst_data else None
             success, log_lines = convert(self.midi_path, output, None, title, author,
                                          transpose_data, chord_window_ms=chord_window,
                                          use_chords=self.use_chords_cb.isChecked(),
-                                         instrument=inst_name)
+                                         instrument=inst_name,
+                                         smooth_octaves=self.smooth_octaves_cb.isChecked())
 
         for line in log_lines:
             self.log(line)
@@ -3802,6 +3977,46 @@ class MainWindow(QMainWindow):
         self._render_worker.finished.connect(self._on_render_done)
         self._render_worker.start()
 
+    def _playback_from_here(self):
+        """Start playback from the current view position (left edge of scroll)."""
+        if self._playback_playing:
+            self._playback_stop()
+
+        if not self._pr_notes:
+            return
+
+        start_ms = self.piano_roll._scroll_x
+
+        # Get all visible notes, then filter to those overlapping or after start_ms
+        melody = set(i for i, t in enumerate(self._pr_tracks) if t.get('melody', False))
+        visible = set(i for i, t in enumerate(self._pr_tracks) if t.get('visible', True))
+        active = []
+        for n in self._pr_notes:
+            if n.deleted or n.simplified or n.track not in visible:
+                continue
+            end_ms = n.start_ms + n.duration_ms
+            if end_ms <= start_ms:
+                continue  # note ends before our start point
+            adj_start = max(0, n.start_ms - start_ms)
+            adj_dur = n.duration_ms if n.start_ms >= start_ms else end_ms - start_ms
+            active.append((adj_start, adj_dur, n.pitch, n.velocity, n.track in melody))
+        active = self.piano_roll._filter_in_range(active)
+        active.sort(key=lambda x: x[0])
+
+        if not active:
+            return
+
+        self._playback_offset_ms = start_ms
+        self._playback_total_ms = max(a[0] + a[1] for a in active) + 200
+
+        self.play_btn.setEnabled(False)
+        self.play_here_btn.setEnabled(False)
+        self.play_btn.setText("Rendering...")
+
+        self._render_worker = RenderWorker(active, gw2_preview=self.gw2_preview_cb.isChecked())
+        self._render_worker.finished.connect(self._on_render_done)
+        self._render_worker.start()
+
     def _on_render_done(self, audio):
         import pygame
         _ensure_pygame()
@@ -3817,6 +4032,7 @@ class MainWindow(QMainWindow):
 
         self.play_btn.setText("⏸ Pause")
         self.play_btn.setEnabled(True)
+        self.play_here_btn.setEnabled(False)
         self.gw2_preview_cb.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self._playback_timer.start()
@@ -3830,6 +4046,7 @@ class MainWindow(QMainWindow):
         self._playback_offset_ms = 0
         self._playback_timer.stop()
         self._update_play_btn_text()
+        self.play_here_btn.setEnabled(bool(self._pr_notes))
         self.stop_btn.setEnabled(False)
         self.gw2_preview_cb.setEnabled(True)
         self.playback_slider.setValue(0)
@@ -4211,7 +4428,8 @@ class MainWindow(QMainWindow):
                 ok, _ = convert(fpath, outpath, None, basename, None,
                                transpose_data, chord_window_ms=chord_window,
                                use_chords=self.use_chords_cb.isChecked(),
-                               instrument=inst_name)
+                               instrument=inst_name,
+                               smooth_octaves=self.smooth_octaves_cb.isChecked())
                 if ok:
                     success_count += 1
                     self.log(f"  ✓ {basename}")
@@ -4326,6 +4544,7 @@ class MainWindow(QMainWindow):
         self.piano_roll.updateSimplifiedNotes()
         self.piano_roll.update()
         self.play_btn.setEnabled(True)
+        self.play_here_btn.setEnabled(True)
         self._enable_export(ahk=True, xml=(self.file_type == 'midi'), submit=True)
 
         label = os.path.basename(self.midi_path) if self.midi_path else "Restored session"
