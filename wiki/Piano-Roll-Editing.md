@@ -5,8 +5,9 @@ The piano roll is the main editing area where you interact with notes visually. 
 ## Navigation
 
 - **Scroll vertically** — mouse wheel
-- **Scroll horizontally** — Shift + mouse wheel, or drag the horizontal scrollbar
+- **Scroll horizontally** — Shift + mouse wheel
 - **Zoom in/out** — Ctrl + mouse wheel, or Ctrl+= / Ctrl+-
+- **Home** / **End** — scroll to the start or end of the song
 - The **minimap** at the bottom shows an overview of all notes; click to jump to a position
 
 ## Selecting Notes
@@ -15,6 +16,7 @@ The piano roll is the main editing area where you interact with notes visually. 
 - **Ctrl+Click** to add/remove a note from the selection
 - **Click empty space** and drag to box-select multiple notes
 - **Ctrl+A** to select all visible notes
+- **Escape** to deselect all notes and clear any range selection
 - Selected notes are highlighted with a bright outline
 
 ## Moving Notes

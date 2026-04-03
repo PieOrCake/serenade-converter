@@ -12,10 +12,11 @@
 | Shortcut | Action |
 |---|---|
 | Ctrl+Z | Undo |
-| Ctrl+Y | Redo |
+| Ctrl+Y / Ctrl+Shift+Z | Redo |
 | Ctrl+C | Copy selected notes |
 | Ctrl+V | Paste notes |
 | Ctrl+A | Select all visible notes |
+| Escape | Deselect all / clear range |
 | Del | Delete selected notes |
 | Ctrl+D | Toggle draw mode (✏ Draw / ⬚ Select) |
 
@@ -25,6 +26,15 @@
 |---|---|
 | Ctrl+= | Zoom in |
 | Ctrl+- | Zoom out |
+| Home | Scroll to start of song |
+| End | Scroll to end of song |
+
+## Playback
+
+| Shortcut | Action |
+|---|---|
+| Space | Play / Pause |
+| Click minimap | Scroll to position |
 
 ## Mouse Controls
 

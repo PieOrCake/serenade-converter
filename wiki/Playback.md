@@ -4,11 +4,13 @@ The converter includes a built-in audio preview so you can hear your arrangement
 
 ## Controls
 
-- **Play** — starts playback from the beginning (or from a range selection)
+- **Play** — starts playback from the beginning (or from a selection/range)
+- **Here** — starts playback from the current view position in the piano roll
 - **Stop** — stops playback
 - **Loop** — when checked, playback restarts automatically when it reaches the end
+- **Space** — keyboard shortcut to toggle play/pause
 
-The current playback position is shown as a **red vertical cursor** on the piano roll, and the time display (bottom-right) shows elapsed / total time.
+The current playback position is shown as a **red vertical cursor** on the piano roll and the **minimap** below it. The time display shows elapsed / total time.
 
 ![Playback](screenshots/playing.png)
 

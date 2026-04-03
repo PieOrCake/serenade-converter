@@ -23,8 +23,12 @@ Notes outside the instrument's range will be flagged as "Out of range" in the st
 
 Controls pitch shifting before conversion:
 
-- **Auto (maximize white keys)** — automatically finds the transpose value that maps the most notes to white keys (natural notes), reducing the number of sharp/flat keypresses
+- **Auto** — automatically finds the transposition that minimizes octave changes during playback
 - **Manual offsets** — shift by a fixed number of semitones (-6 to +6)
+
+## Smooth Octave Changes
+
+When enabled, short octave excursions in fast passages are flattened to reduce the number of octave switches. This can improve playback reliability in GW2 where rapid octave changes may not register correctly.
 
 ## Chord Window
 

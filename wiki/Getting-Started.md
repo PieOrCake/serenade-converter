@@ -37,7 +37,8 @@ The interface has these main areas:
 - **Track list** (left) — shows all tracks with visibility checkboxes; right-click for track tools
 - **Piano roll** (center) — visual note editor; scroll, zoom, select, draw, and edit notes
 - **Conversion Settings** (bottom-left) — transpose, chord window, and chord mode options
-- **Playback controls** (bottom) — Play, Stop, Loop, and a time display
+- **Minimap** — song overview below the piano roll; click to scroll, shows playback cursor
+- **Playback controls** (bottom) — Play, Here, Stop, Loop, and a time display
 - **Status bar** — note count, duration, octave span, octave changes, out-of-range count
 - **Log panel** (bottom) — shows messages, conversion output, and errors
 
