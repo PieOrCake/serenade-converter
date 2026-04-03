@@ -13,7 +13,7 @@ GW2 Piano mapping (C Major instruments):
     GW2 piano has 3 octaves (low/mid/high).
 """
 
-__version__ = '1.1.0'
+__version__ = '1.1.1'
 
 import sys
 import webbrowser
@@ -687,7 +687,7 @@ def convert(midi_file, output_file, track_indices=None, title=None, author=None,
     if author:
         lines.append(f'; author: {author}')
     lines.append(f'; instrument: {instrument or "Piano"}')
-    lines.append('; Converted by Serenade Music Converter')
+    lines.append(f'; Converted by Serenade Music Converter v{__version__}')
     lines.append('')
 
     # First pass: compute target octave for each group
@@ -1576,10 +1576,11 @@ class PianoRollWidget(QWidget):
         # Clipboard
         self._clipboard = []  # list of (relative_ms, duration_ms, pitch, velocity, track)
 
-        # Scrollbars
+        # Scrollbars (horizontal hidden — minimap handles horizontal navigation)
         self._hscroll = QScrollBar(Qt.Orientation.Horizontal, self)
         self._hscroll.setFixedHeight(self.SCROLLBAR_SIZE)
         self._hscroll.valueChanged.connect(self._on_hscroll)
+        self._hscroll.hide()
         self._vscroll = QScrollBar(Qt.Orientation.Vertical, self)
         self._vscroll.setFixedWidth(self.SCROLLBAR_SIZE)
         self._vscroll.valueChanged.connect(self._on_vscroll)
@@ -2099,7 +2100,8 @@ class PianoRollWidget(QWidget):
         p.setPen(QPen(QColor(80, 80, 80), 1))
         p.drawLine(0, self.RULER_HEIGHT, w, self.RULER_HEIGHT)
 
-        # Notes
+        # Notes (clip to note area so they don't overlap pitch labels)
+        p.setClipRect(na_x, na_y, w - na_x, h - na_y)
         for note in self._notes:
             if note.deleted:
                 continue
@@ -2184,6 +2186,8 @@ class PianoRollWidget(QWidget):
                        QColor(100, 200, 100, 120))
             p.setPen(QPen(QColor(100, 200, 100, 200), 1))
             p.drawRect(int(gx), int(gy) + 1, int(gw), self.NOTE_HEIGHT - 2)
+
+        p.setClipping(False)
 
         # Playback cursor
         if self._cursor_ms >= 0:
@@ -2633,6 +2637,22 @@ class PianoRollWidget(QWidget):
             self.copySelected()
         elif event.key() == Qt.Key.Key_V and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.pasteClipboard()
+        elif event.key() == Qt.Key.Key_Home:
+            self._scroll_x = 0
+            self._update_scrollbars()
+            self.update()
+        elif event.key() == Qt.Key.Key_End:
+            view_w = self.width() - self.PIANO_WIDTH - self.SCROLLBAR_SIZE
+            self._scroll_x = max(0, self._total_ms - view_w / self._px_per_ms)
+            self._update_scrollbars()
+            self.update()
+        elif event.key() == Qt.Key.Key_Space:
+            # Bubble up to MainWindow for playback toggle
+            parent = self.parent()
+            while parent and not isinstance(parent, QMainWindow):
+                parent = parent.parent()
+            if parent and hasattr(parent, '_playback_toggle'):
+                parent._playback_toggle()
         else:
             super().keyPressEvent(event)
 
@@ -2808,10 +2828,6 @@ class MainWindow(QMainWindow):
         self._snap_action.setCheckable(True)
         self._snap_action.setChecked(False)
         self._snap_action.toggled.connect(self._toggle_snap)
-        self._minimap_action = view_menu.addAction("&Minimap")
-        self._minimap_action.setCheckable(True)
-        self._minimap_action.setChecked(True)
-        self._minimap_action.toggled.connect(self._toggle_minimap)
         view_menu.addSeparator()
         theme_submenu = view_menu.addMenu("&Theme")
         theme_submenu.addAction("Dark", lambda: self._set_theme('dark'))
@@ -2828,6 +2844,7 @@ class MainWindow(QMainWindow):
         tools_menu.addAction("Edit Note &Velocity...", self._edit_velocity)
 
         help_menu = menubar.addMenu("&Help")
+        help_menu.addAction("&User Guide", lambda: self._open_url("https://github.com/PieOrCake/serenade-converter/wiki"))
         help_menu.addAction("&Keyboard Shortcuts", self._show_shortcuts)
         help_menu.addAction("&About", self._show_about)
 
@@ -2862,6 +2879,14 @@ class MainWindow(QMainWindow):
         toolbar2.addWidget(self.instrument_combo)
 
         toolbar2.addStretch()
+
+        # Update checker label (hidden until update found)
+        self._update_label = QLabel()
+        self._update_label.setTextFormat(Qt.TextFormat.RichText)
+        self._update_label.setOpenExternalLinks(False)
+        self._update_label.linkActivated.connect(self._open_url)
+        self._update_label.hide()
+        toolbar2.addWidget(self._update_label)
 
         self._mode_btn = QPushButton("⬚ Select")
         self._mode_btn.setCheckable(True)
@@ -3029,8 +3054,7 @@ class MainWindow(QMainWindow):
         self.playback_slider.setValue(0)
         self.playback_slider.setTextVisible(False)
         self.playback_slider.setFixedHeight(16)
-        self.playback_slider.mousePressEvent = self._on_progress_click
-        transport.addWidget(self.playback_slider, 1)
+        self.playback_slider.hide()  # minimap handles progress display
 
         self.playback_time_label = QLabel("0:00 / 0:00")
         self.playback_time_label.setStyleSheet("color: #aaa; font-size: 11px;")
@@ -3077,6 +3101,9 @@ class MainWindow(QMainWindow):
         self.log_text.setMaximumHeight(80)
         self.log_text.setPlaceholderText("Log...")
         main_layout.addWidget(self.log_text)
+
+        # Check for updates after UI is shown
+        QTimer.singleShot(2000, self._check_for_updates)
 
     def log(self, msg):
         self.log_text.append(msg)
@@ -3476,17 +3503,24 @@ class MainWindow(QMainWindow):
             "Copy: Ctrl+C\n"
             "Paste: Ctrl+V\n"
             "Select all: Ctrl+A\n"
+            "Deselect all: Escape\n"
             "Delete selected: Del\n\n"
             "VIEW\n"
             "Draw mode: Ctrl+D\n"
             "Zoom in: Ctrl+= / Ctrl+wheel up\n"
             "Zoom out: Ctrl+- / Ctrl+wheel down\n"
             "Scroll: Mouse wheel\n"
-            "Horizontal scroll: Shift + Mouse wheel\n\n"
+            "Horizontal scroll: Shift + Mouse wheel\n"
+            "Go to start: Home\n"
+            "Go to end: End\n\n"
+            "PLAYBACK\n"
+            "Play / Pause: Space\n"
+            "Click minimap: Scroll to position\n\n"
             "PIANO ROLL\n"
             "Select notes: Click / Drag box\n"
             "Multi-select: Ctrl+Click\n"
             "Toggle simplified: Ctrl+Shift+Click (on simplified tracks)\n"
+            "Select time range: Click+drag on ruler\n"
             "Right-click note: Delete note\n"
             "Right-click ruler: Trim menu\n"
             "Drag note edge: Resize note\n\n"
@@ -3499,9 +3533,9 @@ class MainWindow(QMainWindow):
             "Select All Notes, Delete Track Notes")
 
     def _schedule_next_coffee_burst(self):
-        """Schedule the next pulse burst at a random interval (10-30 minutes)."""
+        """Schedule the next pulse burst at a random interval (5-15 minutes)."""
         import random
-        delay_ms = random.randint(10 * 60 * 1000, 30 * 60 * 1000)
+        delay_ms = random.randint(5 * 60 * 1000, 15 * 60 * 1000)
         self._coffee_schedule_timer.start(delay_ms)
 
     def _start_coffee_burst(self):
@@ -3549,6 +3583,45 @@ class MainWindow(QMainWindow):
         except Exception:
             import webbrowser
             webbrowser.open(url)
+
+    def _check_for_updates(self):
+        """Check GitHub for a newer converter release in a background thread."""
+        import threading
+        self._latest_version = None
+        def _fetch():
+            try:
+                url = "https://api.github.com/repos/PieOrCake/serenade-converter/releases/latest"
+                req = urllib.request.Request(url, headers={"User-Agent": "Serenade-Converter"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                    self._latest_version = data.get("tag_name", "").lstrip("v")
+            except Exception:
+                pass
+        t = threading.Thread(target=_fetch, daemon=True)
+        t.start()
+        # Poll for result without blocking the UI
+        def _poll():
+            if t.is_alive():
+                QTimer.singleShot(500, _poll)
+                return
+            self._on_update_result()
+        QTimer.singleShot(500, _poll)
+
+    def _on_update_result(self):
+        """Called when the background version check finishes."""
+        if not self._latest_version:
+            return
+        current = tuple(int(x) for x in __version__.split('.'))
+        try:
+            latest = tuple(int(x) for x in self._latest_version.split('.'))
+        except ValueError:
+            return
+        if latest > current:
+            self._update_label.setText(
+                f"<a href='https://pie.rocks.cc/projects/serenade-converter/' "
+                f"style='color: #e8a050; text-decoration: none; font-weight: bold;'>"
+                f"⬆ Update available: v{self._latest_version}</a>")
+            self._update_label.show()
 
     def _on_draw_btn_toggled(self, checked):
         """Sync draw mode between toolbar button and menu action."""
@@ -4188,9 +4261,6 @@ class MainWindow(QMainWindow):
             self.piano_roll._snap_ms = 60000.0 / bpm / 4  # snap to 1/16th notes
         else:
             self.piano_roll._snap_ms = 0.0
-
-    def _toggle_minimap(self, visible):
-        self._minimap.setVisible(visible)
 
     def _set_theme(self, theme):
         app = QApplication.instance()
