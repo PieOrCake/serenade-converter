@@ -28,7 +28,16 @@ Right-click any track to access track tools:
 
 ## Melody Track
 
-Setting a track as the **melody** track (♪) tells the converter to prioritize its notes when resolving chord conflicts. When multiple notes from different tracks overlap, melody notes take priority. Only one track can be the melody at a time.
+Setting a track as the **melody** track (♪) tells the converter to prioritize its notes. Only one track can be the melody at a time.
+
+When a melody track is set, the converter automatically detects notes on other tracks that:
+- Play at the **same time** as a melody note (within 5ms)
+- Share the same **pitch class** (e.g. both are a C, or both are an F#)
+- Are in a **lower octave** than the melody note
+
+These lower-octave duplicates are hidden (marked as simplified) because they muddy the melody without adding harmonic value. Fill notes with *different* pitch classes are preserved, keeping the arrangement rich while letting the melody cut through.
+
+The log shows how many duplicates were hidden when you set a melody track. You can use **Ctrl+Shift+Click** on any hidden note to manually override the decision (same as chord simplification overrides).
 
 ## Track Colors
 

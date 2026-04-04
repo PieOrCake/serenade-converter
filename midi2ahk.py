@@ -13,7 +13,7 @@ GW2 Piano mapping (C Major instruments):
     GW2 piano has 3 octaves (low/mid/high).
 """
 
-__version__ = '1.1.1'
+__version__ = '1.2.0'
 
 import sys
 import webbrowser
@@ -1607,10 +1607,9 @@ class PianoRollWidget(QWidget):
             self._hscroll.setRange(0, int(total_px - view_w))
             self._hscroll.setPageStep(int(view_w))
             self._hscroll.setValue(int(self._scroll_x * self._px_per_ms))
-            self._hscroll.setVisible(True)
         else:
             self._hscroll.setRange(0, 0)
-            self._hscroll.setVisible(False)
+        self._hscroll.setVisible(False)
         # Vertical
         pitch_rows = self._pitch_max - self._pitch_min + 1
         view_h = self.height() - self.RULER_HEIGHT - self.SCROLLBAR_SIZE
@@ -1799,17 +1798,17 @@ class PianoRollWidget(QWidget):
         """Mark notes that would be removed by per-track simplification.
         For each track with simplify=True, groups that track's notes by time
         and keeps only the highest (treble) and lowest (bass) notes, marking
-        the rest as simplified. Manual overrides are applied afterwards."""
+        the rest as simplified.  Then, if a melody track is set, hide
+        lower-octave duplicates from non-melody tracks that share a pitch
+        class with a simultaneous melody note.
+        Manual overrides are applied afterwards."""
         # Clear auto-computed state
         for n in self._notes:
             n.simplified = False
-        # Find tracks with simplify enabled
-        simplify_tracks = set(i for i, t in enumerate(self._tracks) if t.get('simplify', False))
-        if not simplify_tracks:
-            return
         visible = set(i for i, t in enumerate(self._tracks) if t.get('visible', True))
-        # Process each simplified track independently
         CHORD_WIN = 5
+        # ── Pass 1: per-track chord simplification ──
+        simplify_tracks = set(i for i, t in enumerate(self._tracks) if t.get('simplify', False))
         for tidx in simplify_tracks:
             if tidx not in visible:
                 continue
@@ -1831,6 +1830,51 @@ class PianoRollWidget(QWidget):
                         if n.pitch != lo and n.pitch != hi:
                             n.simplified = True
                 i = j
+        # ── Pass 2: melody priority — hide lower-octave duplicates ──
+        melody_tracks = set(i for i, t in enumerate(self._tracks) if t.get('melody', False))
+        if melody_tracks:
+            # Collect melody notes grouped by time
+            melody_notes = [n for n in self._notes
+                            if not n.deleted and not n.simplified
+                            and n.track in melody_tracks and n.track in visible]
+            melody_notes.sort(key=lambda n: n.start_ms)
+            # Build time buckets: list of (bucket_start_ms, set of (pitch_class, pitch))
+            buckets = []
+            i = 0
+            while i < len(melody_notes):
+                bucket_start = melody_notes[i].start_ms
+                pitches = set()
+                j = i
+                while j < len(melody_notes) and melody_notes[j].start_ms - bucket_start <= CHORD_WIN:
+                    pitches.add((melody_notes[j].pitch % 12, melody_notes[j].pitch))
+                    j += 1
+                buckets.append((bucket_start, pitches))
+                i = j
+            # Scan non-melody visible notes
+            non_melody = [n for n in self._notes
+                          if not n.deleted and not n.simplified
+                          and n.track not in melody_tracks and n.track in visible]
+            non_melody.sort(key=lambda n: n.start_ms)
+            bi = 0
+            for n in non_melody:
+                # Advance bucket index past buckets that are too early
+                while bi > 0 and bi < len(buckets) and buckets[bi][0] > n.start_ms + CHORD_WIN:
+                    bi -= 1
+                while bi < len(buckets) and buckets[bi][0] < n.start_ms - CHORD_WIN:
+                    bi += 1
+                # Check nearby buckets for pitch-class collision
+                for bk in range(bi, len(buckets)):
+                    bstart, bpitches = buckets[bk]
+                    if bstart > n.start_ms + CHORD_WIN:
+                        break
+                    if abs(bstart - n.start_ms) <= CHORD_WIN:
+                        pc = n.pitch % 12
+                        for mel_pc, mel_pitch in bpitches:
+                            if pc == mel_pc and n.pitch < mel_pitch:
+                                n.simplified = True
+                                break
+                    if n.simplified:
+                        break
         # Apply manual overrides
         for n in self._notes:
             if n.simplified_manual is True:
@@ -2666,6 +2710,20 @@ class MinimapWidget(QWidget):
         super().__init__()
         self._main = main_window
         self.setMinimumHeight(20)
+        self._dragging = False
+        self._drag_offset_px = 0.0
+
+    def _viewport_px(self):
+        """Return (vx, vw, ms_scale) for the viewport rect in minimap pixel coords."""
+        pr = self._main.piano_roll
+        max_ms = pr._total_ms
+        if max_ms <= 0:
+            return None
+        w = self.width()
+        ms_scale = w / max_ms
+        vx = pr._scroll_x * ms_scale
+        vw = (pr.width() - pr.PIANO_WIDTH - pr.SCROLLBAR_SIZE) / pr._px_per_ms * ms_scale
+        return vx, vw, ms_scale
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -2679,7 +2737,6 @@ class MinimapWidget(QWidget):
             p.end()
             return
         w, h = self.width(), self.height()
-        min_ms = 0
         max_ms = mw.piano_roll._total_ms
         if max_ms <= 0:
             p.end()
@@ -2712,20 +2769,39 @@ class MinimapWidget(QWidget):
         p.end()
 
     def mousePressEvent(self, event):
-        self._seek_from_click(event)
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        vp = self._viewport_px()
+        if vp is None:
+            return
+        vx, vw, ms_scale = vp
+        click_x = event.position().x()
+        self._dragging = True
+        if vx <= click_x <= vx + vw:
+            self._drag_offset_px = click_x - vx
+        else:
+            self._drag_offset_px = vw / 2
+            new_scroll_ms = max(0, (click_x - vw / 2) / ms_scale)
+            self.seekRequested.emit(new_scroll_ms)
+        event.accept()
 
     def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.MouseButton.LeftButton:
-            self._seek_from_click(event)
-
-    def _seek_from_click(self, event):
-        mw = self._main
-        max_ms = mw.piano_roll._total_ms
-        if max_ms <= 0:
+        if not self._dragging:
             return
-        ms = event.position().x() / self.width() * max_ms
-        ms = max(0, min(max_ms, ms))
-        self.seekRequested.emit(ms)
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        vp = self._viewport_px()
+        if vp is None:
+            return
+        _, _, ms_scale = vp
+        click_x = event.position().x()
+        new_scroll_ms = max(0, (click_x - self._drag_offset_px) / ms_scale)
+        self.seekRequested.emit(new_scroll_ms)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = False
+        event.accept()
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -3278,9 +3354,10 @@ class MainWindow(QMainWindow):
         self.piano_roll.updateSimplifiedNotes()
         self.piano_roll.update()
         if track_idx is not None and track_idx < len(self._pr_tracks):
-            self.log(f"Melody track: {self._pr_tracks[track_idx]['name']}")
+            melody_hidden = sum(1 for n in self._pr_notes if n.simplified and n.track != track_idx)
+            self.log(f"♪ Melody track: {self._pr_tracks[track_idx]['name']} ({melody_hidden} lower-octave duplicates hidden)")
         else:
-            self.log("Melody track cleared")
+            self.log("♪ Melody track cleared")
 
     def _clamp_to_octave(self, base_pitch):
         """Clamp selected notes (or selected track's notes) into a single octave starting at base_pitch."""

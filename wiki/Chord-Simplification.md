@@ -35,9 +35,16 @@ You can manually override the simplification decision for individual notes:
 
 Manual overrides are shown by the note returning to its normal or dimmed state. They persist across sessions and are cleared if you disable simplification on the track.
 
+## Melody Priority
+
+When a [melody track](Track-Management#melody-track) is set, an additional simplification pass runs automatically: notes on non-melody tracks that share a pitch class with a simultaneous melody note but are in a lower octave are hidden. This prevents bass doublings from muddying the melody while preserving harmonic fill notes. See [Track Management — Melody Track](Track-Management#melody-track) for details.
+
+Melody priority and per-track chord simplification work together — both passes run in sequence, and manual overrides apply to either.
+
 ## Tips
 
 - Simplification works best on tracks with dense chords (orchestral arrangements, piano pieces with full voicing)
 - You can simplify multiple tracks independently — each track is processed on its own
 - Use simplification together with track visibility to build a clean arrangement: hide tracks you don't need, simplify tracks that are too busy
+- Combine **✂ Simplify** with **♪ Melody** for best results: simplify reduces chord density, melody priority clears bass doublings
 - The status bar shows the total note count after simplification, so you can gauge the effect
