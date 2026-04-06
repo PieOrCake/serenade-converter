@@ -24,7 +24,8 @@
 
 - **[Getting Started](Getting-Started)** — loading files, basic workflow
 - **[Piano Roll Editing](Piano-Roll-Editing)** — selecting, drawing, moving, and resizing notes
-- **[Track Management](Track-Management)** — visibility, melody, octave tools, split/merge
+- **[Track Management](Track-Management)** — visibility, melody, preserve, octave tools, split/merge
+- **[Analyse & Auto-Fix](Analyse-and-Auto-Fix)** — automated analysis and one-click fix for GW2 playback issues
 - **[Chord Simplification](Chord-Simplification)** — per-track simplification to reduce complexity
 - **[Conversion Settings](Conversion-Settings)** — transpose, chord window, instruments, chord mode
 - **[Playback](Playback)** — previewing your arrangement

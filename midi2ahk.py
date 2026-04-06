@@ -13,7 +13,7 @@ GW2 Piano mapping (C Major instruments):
     GW2 piano has 3 octaves (low/mid/high).
 """
 
-__version__ = '1.2.0'
+__version__ = '1.3.0'
 
 import sys
 import webbrowser
@@ -22,6 +22,8 @@ import re
 import json
 import urllib.request
 import urllib.parse
+from bisect import bisect_left, bisect_right
+from collections import Counter
 
 # Add venv to path
 VENV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.venv')
@@ -39,7 +41,8 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QFileDialog, QComboBox, QLineEdit, QTextEdit,
     QGroupBox, QProgressBar, QMessageBox, QListWidget, QListWidgetItem,
     QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QTabWidget, QCheckBox, QSplitter, QScrollBar, QMenu
+    QTabWidget, QCheckBox, QSplitter, QScrollBar, QMenu, QSpinBox,
+    QDialog, QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QSettings, QTimer, QThread, pyqtSignal, QRectF, QPointF
 from PyQt6.QtGui import QFont, QPainter, QColor, QPen, QBrush, QCursor, QPolygonF, QIcon, QKeySequence
@@ -230,18 +233,22 @@ def midi_note_to_gw2(note, base_octave_midi=48):
         return None
     octave = offset // 12
     semitone = offset % 12
+    # Boundary C notes (semitone 0) can be played as key 8 (C') in the
+    # previous octave, avoiding an unnecessary octave switch.
+    if semitone == 0 and octave > 0:
+        return (octave - 1, 'note', 8)
     key_type, key_num = NOTE_MAP[semitone]
     return (octave, key_type, key_num)
 
 
 def gw2_key_name(key_type, key_num):
     if key_type == 'note':
-        return f'Numpad{key_num}'
+        return str(key_num)  # regular number row keys (not numpad)
     else:
         return f'F{key_num}'
 
 
-# GW2 mode system: Numpad0 increases, Numpad9 decreases
+# GW2 mode system: 0 increases (octave up), 9 decreases (octave down)
 GW2_MODE_LOW = 0
 GW2_MODE_MID = 1
 GW2_MODE_HIGH = 2
@@ -850,11 +857,11 @@ def convert(midi_file, output_file, track_indices=None, title=None, author=None,
             if target_mode != current_mode:
                 if target_mode > current_mode:
                     for _ in range(target_mode - current_mode):
-                        lines.append('SendInput {Numpad0}')
+                        lines.append('SendInput {0}')
                         lines.append(f'Sleep, {OCTAVE_SWITCH_MS}')
                 else:
                     for _ in range(current_mode - target_mode):
-                        lines.append('SendInput {Numpad9}')
+                        lines.append('SendInput {9}')
                         lines.append(f'Sleep, {OCTAVE_SWITCH_MS}')
                 current_mode = target_mode
             # Send root key
@@ -867,11 +874,11 @@ def convert(midi_file, output_file, track_indices=None, title=None, author=None,
             if target_mode_oct != current_mode:
                 if target_mode_oct > current_mode:
                     for _ in range(target_mode_oct - current_mode):
-                        lines.append('SendInput {Numpad0}')
+                        lines.append('SendInput {0}')
                         lines.append(f'Sleep, {OCTAVE_SWITCH_MS}')
                 else:
                     for _ in range(current_mode - target_mode_oct):
-                        lines.append('SendInput {Numpad9}')
+                        lines.append('SendInput {9}')
                         lines.append(f'Sleep, {OCTAVE_SWITCH_MS}')
                 current_mode = target_mode_oct
 
@@ -1283,6 +1290,166 @@ def fix_gw2_issues(notes):
 
     return fixes
 
+def analyze_song(notes, tracks, inst_lo, inst_hi):
+    """Comprehensive GW2 playback analysis across all tracks.
+
+    Args:
+        notes: list of PianoRollNote
+        tracks: list of track info dicts (with 'melody', 'name', etc.)
+        inst_lo: instrument low MIDI pitch
+        inst_hi: instrument high MIDI pitch
+
+    Returns a report dict with per-track issues and suggested fixes,
+    or None if no active notes.
+    """
+    base_pitch = inst_lo + 12  # mid octave root
+    active = [n for n in notes if not n.deleted and not n.simplified]
+    if not active:
+        return None
+
+    melody_idxs = set(i for i, t in enumerate(tracks) if t.get('melody', False))
+    visible_idxs = set(i for i, t in enumerate(tracks) if t.get('visible', True))
+    CHORD_WIN = 5  # ms
+
+    # Build melody pitch-class lookup by time for bass duplicate detection
+    melody_notes = sorted(
+        [n for n in active if n.track in melody_idxs],
+        key=lambda n: n.start_ms)
+    mel_lookup = []  # (start_ms, set of (pitch_class, pitch))
+    mi = 0
+    while mi < len(melody_notes):
+        t0 = melody_notes[mi].start_ms
+        pcs = set()
+        mj = mi
+        while mj < len(melody_notes) and melody_notes[mj].start_ms - t0 <= CHORD_WIN:
+            pcs.add((melody_notes[mj].pitch % 12, melody_notes[mj].pitch))
+            mj += 1
+        mel_lookup.append((t0, pcs))
+        mi = mj
+
+    track_reports = []
+
+    for tidx, tinfo in enumerate(tracks):
+        if tidx not in visible_idxs:
+            continue
+        tnotes = sorted(
+            [n for n in active if n.track == tidx],
+            key=lambda n: n.start_ms)
+        if not tnotes:
+            continue
+
+        is_mel = tinfo.get('melody', False)
+        r = {
+            'index': tidx,
+            'name': tinfo['name'],
+            'is_melody': is_mel,
+            'note_count': len(tnotes),
+            'out_of_range': 0,
+            'octave_switches': 0,
+            'rapid_switches': 0,
+            'bass_dupes': 0,
+            'dense_chords': 0,
+            'tight_notes': 0,
+            'fixes': [],
+        }
+
+        # Out of range
+        for n in tnotes:
+            if n.pitch < inst_lo or n.pitch > inst_hi:
+                r['out_of_range'] += 1
+
+        # Octave switches and rapid switches
+        prev_oct = None
+        prev_end = 0
+        for n in tnotes:
+            o = _note_octave(n.pitch, base_pitch)
+            if prev_oct is not None and o != prev_oct:
+                r['octave_switches'] += 1
+                gap = n.start_ms - prev_end
+                if gap < GW2_MIN_NOTE_DELAY_MS + GW2_OCTAVE_SWAP_DELAY_MS:
+                    r['rapid_switches'] += 1
+            prev_oct = o
+            prev_end = n.start_ms + n.duration_ms
+
+        # Bass duplicates (non-melody tracks only)
+        if not is_mel and mel_lookup:
+            bi = 0
+            for n in tnotes:
+                while bi < len(mel_lookup) - 1 and mel_lookup[bi + 1][0] <= n.start_ms + CHORD_WIN:
+                    bi += 1
+                for bk in range(max(0, bi - 1), min(len(mel_lookup), bi + 2)):
+                    bstart, bpcs = mel_lookup[bk]
+                    if abs(bstart - n.start_ms) <= CHORD_WIN:
+                        pc = n.pitch % 12
+                        if any(pc == mpc and n.pitch < mp for mpc, mp in bpcs):
+                            r['bass_dupes'] += 1
+                            break
+
+        # Dense chords (>2 simultaneous notes in one track)
+        ci = 0
+        while ci < len(tnotes):
+            grp = 1
+            cj = ci + 1
+            while cj < len(tnotes) and tnotes[cj].start_ms - tnotes[ci].start_ms < CHORD_WIN:
+                grp += 1
+                cj += 1
+            if grp > 2:
+                r['dense_chords'] += 1
+            ci = cj
+
+        # Tight timing between sequential notes
+        for i in range(len(tnotes) - 1):
+            gap = tnotes[i + 1].start_ms - (tnotes[i].start_ms + tnotes[i].duration_ms)
+            co = _note_octave(tnotes[i].pitch, base_pitch)
+            no = _note_octave(tnotes[i + 1].pitch, base_pitch)
+            min_gap = GW2_MIN_NOTE_DELAY_MS + (GW2_OCTAVE_SWAP_DELAY_MS if co != no else 0)
+            if 0 <= gap < min_gap:
+                r['tight_notes'] += 1
+
+        # Suggest fixes based on detected issues
+        # Melody: only suggest octave shift if a large portion is OOR.
+        # Small OOR counts are acceptable — shifting creates octave changes
+        # across all tracks which is worse than a few clamped notes.
+        is_preserved = tinfo.get('preserve', False)
+        oor_threshold = 0.2 if is_mel else 0.0
+        if r['out_of_range'] > len(tnotes) * oor_threshold:
+            if r['out_of_range'] > 0:
+                r['fixes'].append('smart_octave')
+            if not is_mel and r['out_of_range'] > len(tnotes) * 0.2:
+                r['fixes'].append('clamp')
+        # Preserved tracks: always clamp any remaining OOR (every effort to keep)
+        if is_preserved and r['out_of_range'] > 0 and 'clamp' not in r['fixes']:
+            r['fixes'].append('clamp')
+        if r['bass_dupes'] > 0 and not is_preserved:
+            r['fixes'].append('debass')
+        if not is_mel and not is_preserved and r['octave_switches'] > len(tnotes) * 0.25:
+            r['fixes'].append('simplify')
+        if r['tight_notes'] > 0:
+            r['fixes'].append('timing')
+
+        track_reports.append(r)
+
+    # Cross-track: simultaneous notes in different octaves
+    all_sorted = sorted(active, key=lambda n: n.start_ms)
+    cross_oct = 0
+    ci = 0
+    while ci < len(all_sorted):
+        grp = [all_sorted[ci]]
+        cj = ci + 1
+        while cj < len(all_sorted) and all_sorted[cj].start_ms - all_sorted[ci].start_ms < CHORD_WIN:
+            grp.append(all_sorted[cj])
+            cj += 1
+        octs = set(_note_octave(n.pitch, base_pitch) for n in grp)
+        if len(octs) > 1:
+            cross_oct += 1
+        ci = cj
+
+    return {
+        'tracks': track_reports,
+        'cross_octave_conflicts': cross_oct,
+        'total_notes': len(active),
+    }
+
 class PianoRollNote:
     __slots__ = ('start_ms', 'duration_ms', 'pitch', 'velocity', 'track', 'selected', 'deleted', 'warning', 'simplified', 'simplified_manual')
     def __init__(self, start_ms, duration_ms, pitch, velocity, track):
@@ -1443,7 +1610,9 @@ def parse_ahk_to_notes(ahk_path):
 
         # SendInput / Send lines
         if 'sendinput' in lower or ('send' in lower and 'sleep' not in lower):
+            # Try brace-wrapped keys first: SendInput {key}
             pos = 0
+            found_brace = False
             while pos < len(trimmed):
                 bstart = trimmed.find('{', pos)
                 if bstart == -1:
@@ -1454,7 +1623,15 @@ def parse_ahk_to_notes(ahk_path):
                 key = parse_brace(trimmed[bstart+1:bend])
                 if key >= 0:
                     events.append(('key', key))
+                    found_brace = True
                 pos = bend + 1
+            # Also handle bare keys: SendInput 0, SendInput 9, SendInput 3
+            if not found_brace:
+                m = _re.search(r'(?:sendinput|send)\s+(\S+)', trimmed, _re.IGNORECASE)
+                if m:
+                    key = parse_brace(m.group(1))
+                    if key >= 0:
+                        events.append(('key', key))
             continue
 
         # Sleep lines
@@ -1528,6 +1705,8 @@ class PianoRollWidget(QWidget):
 
     notesChanged = pyqtSignal()
     selectionChanged = pyqtSignal()  # emitted when note selection or range changes
+    pianoRollContextMenu = pyqtSignal(object)  # emitted with QPoint global pos on right-click
+    scrollChanged = pyqtSignal()  # emitted when scroll position changes
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1545,6 +1724,7 @@ class PianoRollWidget(QWidget):
         self._sel_start = None
         self._sel_end = None
         self._bpm = 120
+        self._tempo_scale = 1.0  # 1.0 = original speed, 0.5 = double speed, 2.0 = half speed
         self._cursor_ms = -1.0  # playback cursor position (-1 = hidden)
         self._range_start_ms = -1.0  # ruler range selection start (-1 = none)
         self._range_end_ms = -1.0    # ruler range selection end
@@ -1624,6 +1804,7 @@ class PianoRollWidget(QWidget):
             self._vscroll.setRange(0, 0)
             self._vscroll.setVisible(False)
         self._updating_scrollbars = False
+        self.scrollChanged.emit()
 
     def _on_hscroll(self, value):
         if self._updating_scrollbars:
@@ -1684,6 +1865,10 @@ class PianoRollWidget(QWidget):
         self._update_scrollbars()
         self.update()
 
+    def _track_offsets(self):
+        """Return dict of track_idx -> time_offset_ms."""
+        return {i: t.get('time_offset_ms', 0) for i, t in enumerate(self._tracks)}
+
     def getActiveNotes(self):
         """Return list of (time_ms, pitch, velocity, is_melody) for non-deleted, visible-track, non-simplified notes."""
         visible = set()
@@ -1693,22 +1878,28 @@ class PianoRollWidget(QWidget):
                 visible.add(i)
             if t.get('melody', False):
                 melody.add(i)
+        offsets = self._track_offsets()
+        ts = self._tempo_scale
         result = []
         for n in self._notes:
             if not n.deleted and not n.simplified and n.track in visible:
-                result.append((n.start_ms, n.pitch, n.velocity, n.track in melody))
+                t_ms = max(0, n.start_ms + offsets.get(n.track, 0)) * ts
+                result.append((t_ms, n.pitch, n.velocity, n.track in melody))
         result.sort(key=lambda x: x[0])
         return result
 
     def getSelectedNotes(self):
         """Return list of (start_ms, duration_ms, pitch, velocity, is_melody) for selected, non-simplified notes."""
         melody = set(i for i, t in enumerate(self._tracks) if t.get('melody', False))
+        offsets = self._track_offsets()
+        ts = self._tempo_scale
         result = []
         for n in self._notes:
             if n.selected and not n.deleted and not n.simplified:
                 if n.track < len(self._tracks) and not self._tracks[n.track].get('visible', True):
                     continue
-                result.append((n.start_ms, n.duration_ms, n.pitch, n.velocity, n.track in melody))
+                t_ms = max(0, n.start_ms + offsets.get(n.track, 0)) * ts
+                result.append((t_ms, n.duration_ms * ts, n.pitch, n.velocity, n.track in melody))
         result.sort(key=lambda x: x[0])
         return result
 
@@ -1725,13 +1916,16 @@ class PianoRollWidget(QWidget):
                 visible.add(i)
             if t.get('melody', False):
                 melody.add(i)
+        offsets = self._track_offsets()
+        ts = self._tempo_scale
         result = []
         for n in self._notes:
             if n.deleted or n.simplified or n.track not in visible:
                 continue
-            # Include note if it overlaps the range
-            if n.start_ms + n.duration_ms >= lo and n.start_ms <= hi:
-                result.append((n.start_ms, n.duration_ms, n.pitch, n.velocity, n.track in melody))
+            t_ms = max(0, n.start_ms + offsets.get(n.track, 0))
+            # Include note if it overlaps the range (compare in original ms)
+            if t_ms + n.duration_ms >= lo and t_ms <= hi:
+                result.append((t_ms * ts, n.duration_ms * ts, n.pitch, n.velocity, n.track in melody))
         result.sort(key=lambda x: x[0])
         return result
 
@@ -1756,17 +1950,20 @@ class PianoRollWidget(QWidget):
 
         ranged = self.getRangeNotes()
         if ranged:
-            offset = min(self._range_start_ms, self._range_end_ms)
+            offset = min(self._range_start_ms, self._range_end_ms) * self._tempo_scale
             adjusted = [(max(0, s - offset), d, p, v, m) for s, d, p, v, m in ranged]
             return self._filter_in_range(adjusted), offset
 
         # All visible
         melody = set(i for i, t in enumerate(self._tracks) if t.get('melody', False))
         visible = set(i for i, t in enumerate(self._tracks) if t.get('visible', True))
+        offsets = self._track_offsets()
+        ts = self._tempo_scale
         all_notes = []
         for n in self._notes:
             if not n.deleted and not n.simplified and n.track in visible:
-                all_notes.append((n.start_ms, n.duration_ms, n.pitch, n.velocity, n.track in melody))
+                t_ms = max(0, n.start_ms + offsets.get(n.track, 0)) * ts
+                all_notes.append((t_ms, n.duration_ms * ts, n.pitch, n.velocity, n.track in melody))
         all_notes.sort(key=lambda x: x[0])
         return self._filter_in_range(all_notes), 0
 
@@ -1833,41 +2030,44 @@ class PianoRollWidget(QWidget):
         # ── Pass 2: melody priority — hide lower-octave duplicates ──
         melody_tracks = set(i for i, t in enumerate(self._tracks) if t.get('melody', False))
         if melody_tracks:
-            # Collect melody notes grouped by time
+            offsets = self._track_offsets()
+            # Collect melody notes grouped by effective time (with offset)
             melody_notes = [n for n in self._notes
                             if not n.deleted and not n.simplified
                             and n.track in melody_tracks and n.track in visible]
-            melody_notes.sort(key=lambda n: n.start_ms)
+            melody_notes.sort(key=lambda n: n.start_ms + offsets.get(n.track, 0))
             # Build time buckets: list of (bucket_start_ms, set of (pitch_class, pitch))
             buckets = []
             i = 0
             while i < len(melody_notes):
-                bucket_start = melody_notes[i].start_ms
+                bucket_start = melody_notes[i].start_ms + offsets.get(melody_notes[i].track, 0)
                 pitches = set()
                 j = i
-                while j < len(melody_notes) and melody_notes[j].start_ms - bucket_start <= CHORD_WIN:
+                while j < len(melody_notes) and (melody_notes[j].start_ms + offsets.get(melody_notes[j].track, 0)) - bucket_start <= CHORD_WIN:
                     pitches.add((melody_notes[j].pitch % 12, melody_notes[j].pitch))
                     j += 1
                 buckets.append((bucket_start, pitches))
                 i = j
             # Scan non-melody visible notes
+            debass_tracks = set(i for i, t in enumerate(self._tracks) if t.get('debass', False))
             non_melody = [n for n in self._notes
                           if not n.deleted and not n.simplified
-                          and n.track not in melody_tracks and n.track in visible]
-            non_melody.sort(key=lambda n: n.start_ms)
+                          and n.track in debass_tracks and n.track in visible]
+            non_melody.sort(key=lambda n: n.start_ms + offsets.get(n.track, 0))
             bi = 0
             for n in non_melody:
+                n_ms = n.start_ms + offsets.get(n.track, 0)
                 # Advance bucket index past buckets that are too early
-                while bi > 0 and bi < len(buckets) and buckets[bi][0] > n.start_ms + CHORD_WIN:
+                while bi > 0 and bi < len(buckets) and buckets[bi][0] > n_ms + CHORD_WIN:
                     bi -= 1
-                while bi < len(buckets) and buckets[bi][0] < n.start_ms - CHORD_WIN:
+                while bi < len(buckets) and buckets[bi][0] < n_ms - CHORD_WIN:
                     bi += 1
                 # Check nearby buckets for pitch-class collision
                 for bk in range(bi, len(buckets)):
                     bstart, bpitches = buckets[bk]
-                    if bstart > n.start_ms + CHORD_WIN:
+                    if bstart > n_ms + CHORD_WIN:
                         break
-                    if abs(bstart - n.start_ms) <= CHORD_WIN:
+                    if abs(bstart - n_ms) <= CHORD_WIN:
                         pc = n.pitch % 12
                         for mel_pc, mel_pitch in bpitches:
                             if pc == mel_pc and n.pitch < mel_pitch:
@@ -2146,12 +2346,13 @@ class PianoRollWidget(QWidget):
 
         # Notes (clip to note area so they don't overlap pitch labels)
         p.setClipRect(na_x, na_y, w - na_x, h - na_y)
+        _offsets = self._track_offsets()
         for note in self._notes:
             if note.deleted:
                 continue
             if note.track < len(self._tracks) and not self._tracks[note.track].get('visible', True):
                 continue
-            draw_ms = note.start_ms
+            draw_ms = note.start_ms + _offsets.get(note.track, 0)
             draw_pitch = note.pitch
             if self._dragging_notes and note.selected:
                 snap = self._snap_ms if self._snap_ms > 0 else 0
@@ -2396,14 +2597,14 @@ class PianoRollWidget(QWidget):
                 ms = self._x_to_ms(px)
                 self._show_trim_menu(event.globalPosition().toPoint(), ms)
                 return
-            # Right-click to delete a note (in any mode)
-            note = self._note_at(event.position())
-            if note:
-                self.pushUndo()
-                note.deleted = True
-                note.selected = False
-                self.notesChanged.emit()
-                self.update()
+            # Right-click on note area: if nothing selected, select note under cursor
+            if not any(n.selected for n in self._notes):
+                note = self._note_at(event.position())
+                if note:
+                    note.selected = True
+                    self.selectionChanged.emit()
+                    self.update()
+            self.pianoRollContextMenu.emit(event.globalPosition().toPoint())
 
     def mouseMoveEvent(self, event):
         px, py = event.position().x(), event.position().y()
@@ -2747,8 +2948,9 @@ class MinimapWidget(QWidget):
         p_range = max_p - min_p + 1
         if p_range <= 0:
             p_range = 1
+        _offsets = mw.piano_roll._track_offsets()
         for n in active:
-            x = n.start_ms * ms_scale
+            x = max(0, n.start_ms + _offsets.get(n.track, 0)) * ms_scale
             nw = max(1, n.duration_ms * ms_scale)
             y = (max_p - n.pitch) / p_range * h
             nh = max(1, h / p_range)
@@ -2802,6 +3004,113 @@ class MinimapWidget(QWidget):
     def mouseReleaseEvent(self, event):
         self._dragging = False
         event.accept()
+
+
+# ── Analysis Dialog ───────────────────────────────────────────────────────────
+
+class AnalysisDialog(QDialog):
+    """Dialog showing a comprehensive GW2 playback analysis report with auto-fix option."""
+    def __init__(self, report, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Song Analysis")
+        self.setMinimumSize(620, 520)
+        self.report = report
+        self.auto_fix_accepted = False
+
+        layout = QVBoxLayout(self)
+
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setFont(QFont("Consolas", 10))
+        layout.addWidget(self.text)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self.fix_btn = QPushButton("Auto-fix All Issues")
+        self.fix_btn.setMinimumHeight(32)
+        self.fix_btn.setStyleSheet(
+            "QPushButton { background-color: #365; border: 2px solid #6b6; border-radius: 4px; "
+            "font-weight: bold; padding: 4px 16px; }"
+            "QPushButton:hover { background-color: #476; }"
+            "QPushButton:disabled { background-color: #333; border-color: #555; color: #777; }")
+        self.fix_btn.clicked.connect(self._accept_fix)
+        close_btn = QPushButton("Close")
+        close_btn.setMinimumHeight(32)
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.fix_btn)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self._build_report()
+
+    def _accept_fix(self):
+        self.auto_fix_accepted = True
+        self.accept()
+
+    def _build_report(self):
+        r = self.report
+        lines = []
+        lines.append("═══════════════════════════════════════")
+        lines.append("         Song Analysis Report")
+        lines.append("═══════════════════════════════════════\n")
+        lines.append(f"Total active notes: {r['total_notes']}")
+        lines.append(f"Cross-octave conflicts: {r['cross_octave_conflicts']}")
+        if r['cross_octave_conflicts'] > 0:
+            lines.append("  (notes in different octaves at the same time)")
+
+        has_any_fix = False
+        for tr in r['tracks']:
+            mel = " ♪ MELODY" if tr['is_melody'] else ""
+            lines.append(f"\n─── {tr['name']}{mel} ({tr['note_count']} notes) ───")
+
+            issues = []
+            if tr['out_of_range']:
+                issues.append(f"  ⚠ Out of range: {tr['out_of_range']} notes")
+            if tr['octave_switches']:
+                rapid = f" ({tr['rapid_switches']} too fast for GW2)" if tr['rapid_switches'] else ""
+                issues.append(f"  ⚠ Octave switches: {tr['octave_switches']}{rapid}")
+            if tr['bass_dupes']:
+                issues.append(f"  ⚠ Bass duplicates: {tr['bass_dupes']} notes duplicate melody at lower octave")
+            if tr['dense_chords']:
+                issues.append(f"  ⚠ Dense chords: {tr['dense_chords']} groups with >2 simultaneous notes")
+            if tr['tight_notes']:
+                issues.append(f"  ⚠ Tight timing: {tr['tight_notes']} notes too close together")
+
+            if not issues:
+                issues.append("  ✓ No issues")
+            lines.extend(issues)
+
+            if tr['fixes']:
+                has_any_fix = True
+                lines.append("  Suggested fixes:")
+                fix_labels = {
+                    'smart_octave': '    → Smart octave shift (fit to instrument range)',
+                    'clamp': '    → Clamp remaining out-of-range notes',
+                    'debass': '    → Remove bass duplicates of melody',
+                    'simplify': '    → Simplify track (reduce filler / octave switches)',
+                    'timing': '    → Adjust note timing (trim overlaps)',
+                }
+                for f in tr['fixes']:
+                    lines.append(fix_labels.get(f, f'    → {f}'))
+                if tr['is_melody']:
+                    lines.append("    (melody track: only safe fixes applied)")
+
+        # Melody-level fixes (not per-track)
+        harm_sub = r.get('melody_harm_sub_candidates', 0)
+        consol = r.get('melody_consolidation_candidates', 0)
+        if harm_sub or consol:
+            has_any_fix = True
+            lines.append("\n─── Melody-wide fixes ───")
+            if harm_sub:
+                lines.append(f"  → Harmonic substitution: {harm_sub} notes (octave down + fifth)")
+            if consol:
+                lines.append(f"  → Octave consolidation: {consol} notes in rapid runs")
+
+        if not has_any_fix:
+            lines.append("\n✓ No fixes needed — song looks good!")
+            self.fix_btn.setEnabled(False)
+
+        self.text.setPlainText('\n'.join(lines))
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -2883,13 +3192,6 @@ class MainWindow(QMainWindow):
         _act.setShortcut(QKeySequence("Ctrl+A"))
         _act = edit_menu.addAction("&Delete Selected\tDel", self._delete_selected_notes)
         _act.setShortcut(QKeySequence("Del"))
-        edit_menu.addSeparator()
-        clamp_submenu = edit_menu.addMenu("Clamp to &Octave")
-        clamp_submenu.addAction("High (C5–B5)", lambda: self._clamp_to_octave(72))
-        clamp_submenu.addAction("Mid (C4–B4)", lambda: self._clamp_to_octave(60))
-        clamp_submenu.addAction("Low (C3–B3)", lambda: self._clamp_to_octave(48))
-        edit_menu.addAction("Octave &Up", lambda: self._shift_track_octave(12))
-        edit_menu.addAction("Octave &Down", lambda: self._shift_track_octave(-12))
 
         view_menu = menubar.addMenu("&View")
         self._draw_action = view_menu.addAction("&Draw Mode\tCtrl+D")
@@ -2904,13 +3206,11 @@ class MainWindow(QMainWindow):
         self._snap_action.setCheckable(True)
         self._snap_action.setChecked(False)
         self._snap_action.toggled.connect(self._toggle_snap)
-        view_menu.addSeparator()
-        theme_submenu = view_menu.addMenu("&Theme")
-        theme_submenu.addAction("Dark", lambda: self._set_theme('dark'))
-        theme_submenu.addAction("Light", lambda: self._set_theme('light'))
 
         tools_menu = menubar.addMenu("&Tools")
         tools_menu.aboutToShow.connect(self._update_tools_menu_state)
+        self._tools_analyse_act = tools_menu.addAction("&Analyse Song...", self._analyse_song)
+        tools_menu.addSeparator()
         self._tools_merge_act = tools_menu.addAction("&Merge Selected Tracks", self._merge_tracks)
         self._tools_split_act = tools_menu.addAction("S&plit Track by Pitch", self._split_track_by_pitch)
         self._tools_smart_oct_act = tools_menu.addAction("Smart &Octave Assignment", self._smart_octave)
@@ -2974,6 +3274,16 @@ class MainWindow(QMainWindow):
             "QPushButton:checked { background-color: #365; border-color: #6b6; color: #8f8; }")
         self._mode_btn.toggled.connect(self._on_draw_btn_toggled)
         toolbar2.addWidget(self._mode_btn)
+
+        self._analyse_btn = QPushButton("🔍 Analyse")
+        self._analyse_btn.setMinimumHeight(30)
+        self._analyse_btn.setFixedWidth(120)
+        self._analyse_btn.setToolTip("Analyse song for GW2 playback issues and auto-fix")
+        self._analyse_btn.setStyleSheet(
+            "QPushButton { background-color: #2a3a4a; border: 2px solid #4a6a8a; border-radius: 4px; font-weight: bold; padding: 2px 8px; }"
+            "QPushButton:hover { background-color: #3a4a5a; }")
+        self._analyse_btn.clicked.connect(self._analyse_song)
+        toolbar2.addWidget(self._analyse_btn)
 
         # ☕ Buy me a coffee button with gentle pulsing burnt orange glow
         self._coffee_btn = QPushButton("☕ Buy me a coffee")
@@ -3090,6 +3400,8 @@ class MainWindow(QMainWindow):
 
         self.piano_roll.selectionChanged.connect(self._update_play_btn_text)
         self.piano_roll.notesChanged.connect(self._on_notes_changed)
+        self.piano_roll.pianoRollContextMenu.connect(self._on_piano_roll_context_menu)
+        self.piano_roll.scrollChanged.connect(self._update_time_label)
 
         # ── Transport bar ─────────────────────────────────────────────
         transport = QHBoxLayout()
@@ -3132,8 +3444,21 @@ class MainWindow(QMainWindow):
         self.playback_slider.setFixedHeight(16)
         self.playback_slider.hide()  # minimap handles progress display
 
+        transport.addStretch(1)
+
+        self._speed_spin = QSpinBox()
+        self._speed_spin.setRange(10, 200)
+        self._speed_spin.setSingleStep(10)
+        self._speed_spin.setValue(100)
+        self._speed_spin.setPrefix("Speed: ")
+        self._speed_spin.setSuffix("%")
+        self._speed_spin.setFixedWidth(110)
+        self._speed_spin.setToolTip("Playback and export speed (10–200%)")
+        self._speed_spin.valueChanged.connect(self._on_speed_changed)
+        transport.addWidget(self._speed_spin)
+
         self.playback_time_label = QLabel("0:00 / 0:00")
-        self.playback_time_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.playback_time_label.setStyleSheet("color: #aaa; font-size: 22px;")
         transport.addWidget(self.playback_time_label)
 
         main_layout.addLayout(transport)
@@ -3217,7 +3542,10 @@ class MainWindow(QMainWindow):
                 'name': name,
                 'visible': True,
                 'melody': False,
+                'preserve': False,
                 'simplify': False,
+                'debass': False,
+                'time_offset_ms': 0,
                 'color': TRACK_COLORS[color_idx],
                 'notes': note_count,
             })
@@ -3239,8 +3567,12 @@ class MainWindow(QMainWindow):
         for i, t in enumerate(self._pr_tracks):
             r, g, b = TRACK_COLORS[i % len(TRACK_COLORS)]
             melody_marker = "♪ " if t.get('melody', False) else ""
+            preserve_marker = "♫ " if t.get('preserve', False) else ""
             simplify_marker = "✂ " if t.get('simplify', False) else ""
-            label = f"{melody_marker}{simplify_marker}{t['name']} ({t['notes']})"
+            debass_marker = "🔇 " if t.get('debass', False) else ""
+            offset = t.get('time_offset_ms', 0)
+            shift_marker = f"⏱{offset:+.0f}ms " if offset != 0 else ""
+            label = f"{melody_marker}{preserve_marker}{simplify_marker}{debass_marker}{shift_marker}{t['name']} ({t['notes']})"
             item = QListWidgetItem(label)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if t.get('visible', True) else Qt.CheckState.Unchecked)
@@ -3274,6 +3606,7 @@ class MainWindow(QMainWindow):
         self._tools_merge_act.setEnabled(has_track)
         self._tools_split_act.setEnabled(has_track)
         self._tools_smart_oct_act.setEnabled(has_track)
+        self._tools_analyse_act.setEnabled(bool(self._pr_notes))
 
     def _on_track_context_menu(self, pos):
         item = self.track_list.itemAt(pos)
@@ -3283,6 +3616,9 @@ class MainWindow(QMainWindow):
         if idx is None:
             return
         menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu::item { padding: 4px 12px 4px 20px; }"
+            "QMenu::item:selected { background: #3a5a7a; color: #fff; }")
         name = self._pr_tracks[idx]['name'] if idx < len(self._pr_tracks) else f"Track {idx}"
         menu.addAction(f"Octave Up  ({name})", lambda: self._shift_track_octave(12))
         menu.addAction(f"Octave Down  ({name})", lambda: self._shift_track_octave(-12))
@@ -3300,11 +3636,30 @@ class MainWindow(QMainWindow):
             menu.addAction("♪ Clear Melody", lambda: self._set_melody_track(None))
         else:
             menu.addAction("♪ Set as Melody", lambda: self._set_melody_track(idx))
+        is_preserved = self._pr_tracks[idx].get('preserve', False) if idx < len(self._pr_tracks) else False
+        if is_preserved:
+            menu.addAction("♫ Clear Preserve", lambda: self._set_track_preserve(idx, False))
+        else:
+            menu.addAction("♫ Preserve Track", lambda: self._set_track_preserve(idx, True))
         is_simplified = self._pr_tracks[idx].get('simplify', False) if idx < len(self._pr_tracks) else False
         if is_simplified:
             menu.addAction("✂ Clear Simplify", lambda: self._set_track_simplify(idx, False))
         else:
             menu.addAction("✂ Simplify (treble + bass)", lambda: self._set_track_simplify(idx, True))
+        has_melody = any(t.get('melody', False) for t in self._pr_tracks)
+        is_debassed = self._pr_tracks[idx].get('debass', False) if idx < len(self._pr_tracks) else False
+        if is_debassed:
+            menu.addAction("🔇 Clear Bass Removal", lambda: self._set_track_debass(idx, False))
+        else:
+            act = menu.addAction("🔇 Remove Bass Duplicates", lambda: self._set_track_debass(idx, True))
+            if not has_melody:
+                act.setEnabled(False)
+                act.setToolTip("Set a melody track first")
+        shift_sub = menu.addMenu("⏱ Time Shift")
+        shift_sub.addAction("→ Shift Forward ⅛ Beat", lambda: self._shift_track_time(idx, +1))
+        shift_sub.addAction("← Shift Back ⅛ Beat", lambda: self._shift_track_time(idx, -1))
+        shift_sub.addSeparator()
+        shift_sub.addAction("Reset Shift", lambda: self._shift_track_time(idx, 0))
         menu.addSeparator()
         menu.addAction("Select All Notes", lambda: self._select_track_notes(idx))
         menu.addAction("Delete Track Notes", lambda: self._delete_track_notes(idx))
@@ -3326,6 +3681,237 @@ class MainWindow(QMainWindow):
             self.piano_roll.notesChanged.emit()
             self.piano_roll.update()
             self.log(f"Deleted {count} notes from track {track_idx}")
+
+    # ── Piano roll context menu (right-click) ────────────────────────
+    def _get_target_notes(self):
+        """Return (notes_list, label) for the current selection or all visible notes."""
+        selected = [n for n in self._pr_notes if n.selected and not n.deleted]
+        if selected:
+            return selected, f"{len(selected)} selected"
+        visible = set(i for i, t in enumerate(self._pr_tracks) if t.get('visible', True))
+        all_vis = [n for n in self._pr_notes if not n.deleted and n.track in visible]
+        return all_vis, f"all {len(all_vis)} notes"
+
+    def _on_piano_roll_context_menu(self, global_pos):
+        """Show context menu on right-click in the piano roll."""
+        targets, label = self._get_target_notes()
+        if not targets:
+            return
+        menu = QMenu(self)
+        # Header showing scope
+        header = menu.addAction(label.upper())
+        header.setEnabled(False)
+        hfont = header.font()
+        hfont.setBold(True)
+        hfont.setPointSize(hfont.pointSize() - 1)
+        header.setFont(hfont)
+        menu.setStyleSheet(
+            "QMenu::item { padding: 4px 12px 4px 20px; }"
+            "QMenu::item:selected { background: #3a5a7a; color: #fff; }"
+            "QMenu::item:disabled { color: #8af; background: #2a3a4a; padding: 4px 12px; }")
+        menu.addSeparator()
+        menu.addAction("Octave Up", lambda: self._octave_shift_targets(12))
+        menu.addAction("Octave Down", lambda: self._octave_shift_targets(-12))
+        clamp_sub = menu.addMenu("Clamp to Octave")
+        clamp_sub.addAction("High (C5–B5)", lambda: self._clamp_targets(72))
+        clamp_sub.addAction("Mid (C4–B4)", lambda: self._clamp_targets(60))
+        clamp_sub.addAction("Low (C3–B3)", lambda: self._clamp_targets(48))
+        menu.addAction("Smart Octave Assignment", self._smart_octave_targets)
+        menu.addSeparator()
+        menu.addAction("✂ Simplify", self._simplify_targets)
+        menu.addAction("✂ Unsimplify", self._unsimplify_targets)
+        has_melody = any(t.get('melody', False) for t in self._pr_tracks)
+        act = menu.addAction("🔇 Remove Bass Duplicates", self._debass_targets)
+        if not has_melody:
+            act.setEnabled(False)
+        shift_sub = menu.addMenu("⏱ Time Shift")
+        shift_sub.addAction("→ Shift Forward ⅛ Beat", lambda: self._time_shift_targets(+1))
+        shift_sub.addAction("← Shift Back ⅛ Beat", lambda: self._time_shift_targets(-1))
+        menu.addSeparator()
+        menu.addAction("Delete", self._delete_targets)
+        menu.exec(global_pos)
+
+    def _octave_shift_targets(self, semitones):
+        """Shift target notes by semitones (±12 = octave)."""
+        targets, label = self._get_target_notes()
+        if not targets:
+            return
+        self.piano_roll.pushUndo()
+        for n in targets:
+            n.pitch += semitones
+        direction = "up" if semitones > 0 else "down"
+        self.log(f"Shifted {label} {direction} one octave")
+        self.piano_roll.notesChanged.emit()
+        self.piano_roll.update()
+
+    def _clamp_targets(self, base_pitch):
+        """Clamp target notes into a single octave starting at base_pitch."""
+        targets, label = self._get_target_notes()
+        if not targets:
+            return
+        self.piano_roll.pushUndo()
+        nn = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
+        oct_name = f"{nn[base_pitch % 12]}{base_pitch // 12 - 1}–{nn[(base_pitch + 11) % 12]}{(base_pitch + 11) // 12 - 1}"
+        count = 0
+        for n in targets:
+            new_pitch = base_pitch + (n.pitch % 12)
+            if new_pitch != n.pitch:
+                n.pitch = new_pitch
+                count += 1
+        self.piano_roll.notesChanged.emit()
+        self.piano_roll.update()
+        self.log(f"Clamped {count} of {label} to {oct_name}")
+
+    def _smart_octave_targets(self):
+        """Assign target notes to the octave that minimizes out-of-range notes."""
+        targets, label = self._get_target_notes()
+        if not targets:
+            return
+        inst_data = self.instrument_combo.currentData()
+        if not inst_data:
+            return
+        lo, hi = inst_data[2], inst_data[3]
+        self.piano_roll.pushUndo()
+        # Group targets by track
+        by_track = {}
+        for n in targets:
+            by_track.setdefault(n.track, []).append(n)
+        total_shifted = 0
+        for tidx, tnotes in by_track.items():
+            best_shift = 0
+            best_oor = len(tnotes)
+            for shift in range(-48, 49, 12):
+                oor = sum(1 for n in tnotes if (n.pitch + shift) < lo or (n.pitch + shift) > hi)
+                if oor < best_oor:
+                    best_oor = oor
+                    best_shift = shift
+            if best_shift != 0:
+                for n in tnotes:
+                    n.pitch += best_shift
+                total_shifted += len(tnotes)
+        self.piano_roll.notesChanged.emit()
+        self.piano_roll.update()
+        self.log(f"Smart octave: adjusted {total_shifted} of {label}")
+
+    def _simplify_targets(self):
+        """Manually mark target notes as simplified."""
+        targets, label = self._get_target_notes()
+        if not targets:
+            return
+        self.piano_roll.pushUndo()
+        count = 0
+        for n in targets:
+            if n.simplified_manual is not True:
+                n.simplified_manual = True
+                count += 1
+        self.piano_roll.updateSimplifiedNotes()
+        self.piano_roll.update()
+        self.log(f"✂ Simplified {count} of {label}")
+
+    def _unsimplify_targets(self):
+        """Clear simplification on target notes."""
+        targets, label = self._get_target_notes()
+        if not targets:
+            return
+        self.piano_roll.pushUndo()
+        count = 0
+        for n in targets:
+            if n.simplified_manual is not None:
+                n.simplified_manual = None
+                count += 1
+        self.piano_roll.updateSimplifiedNotes()
+        self.piano_roll.update()
+        self.log(f"✂ Cleared simplify overrides on {count} of {label}")
+
+    def _debass_targets(self):
+        """Remove lower-octave duplicates from targets relative to melody track."""
+        targets, label = self._get_target_notes()
+        if not targets:
+            return
+        melody_tracks = set(i for i, t in enumerate(self._pr_tracks) if t.get('melody', False))
+        if not melody_tracks:
+            self.log("Set a melody track first.")
+            return
+        visible = set(i for i, t in enumerate(self._pr_tracks) if t.get('visible', True))
+        offsets = self.piano_roll._track_offsets()
+        CHORD_WIN = 5
+        # Collect melody notes
+        melody_notes = [n for n in self._pr_notes
+                        if not n.deleted and not n.simplified
+                        and n.track in melody_tracks and n.track in visible]
+        melody_notes.sort(key=lambda n: n.start_ms + offsets.get(n.track, 0))
+        if not melody_notes:
+            self.log("No melody notes found.")
+            return
+        # Build time buckets
+        buckets = []
+        i = 0
+        while i < len(melody_notes):
+            bucket_start = melody_notes[i].start_ms + offsets.get(melody_notes[i].track, 0)
+            pitches = set()
+            j = i
+            while j < len(melody_notes) and (melody_notes[j].start_ms + offsets.get(melody_notes[j].track, 0)) - bucket_start <= CHORD_WIN:
+                pitches.add((melody_notes[j].pitch % 12, melody_notes[j].pitch))
+                j += 1
+            buckets.append((bucket_start, pitches))
+            i = j
+        # Check each target note (skip melody notes themselves)
+        self.piano_roll.pushUndo()
+        target_set = set(id(n) for n in targets)
+        non_melody = [n for n in targets if n.track not in melody_tracks]
+        non_melody.sort(key=lambda n: n.start_ms + offsets.get(n.track, 0))
+        count = 0
+        bi = 0
+        for n in non_melody:
+            n_ms = n.start_ms + offsets.get(n.track, 0)
+            while bi > 0 and bi < len(buckets) and buckets[bi][0] > n_ms + CHORD_WIN:
+                bi -= 1
+            while bi < len(buckets) and buckets[bi][0] < n_ms - CHORD_WIN:
+                bi += 1
+            for bk in range(bi, len(buckets)):
+                bstart, bpitches = buckets[bk]
+                if bstart > n_ms + CHORD_WIN:
+                    break
+                if abs(bstart - n_ms) <= CHORD_WIN:
+                    pc = n.pitch % 12
+                    for mel_pc, mel_pitch in bpitches:
+                        if pc == mel_pc and n.pitch < mel_pitch:
+                            n.simplified_manual = True
+                            count += 1
+                            break
+                if n.simplified_manual is True:
+                    break
+        self.piano_roll.updateSimplifiedNotes()
+        self.piano_roll.update()
+        self.log(f"🔇 Bass removal: {count} lower-octave duplicates hidden in {label}")
+
+    def _time_shift_targets(self, direction):
+        """Destructive time shift on target notes by ⅛ beat."""
+        targets, label = self._get_target_notes()
+        if not targets:
+            return
+        bpm = self.piano_roll._bpm or 120
+        eighth_ms = (60000.0 / bpm) / 2
+        self.piano_roll.pushUndo()
+        for n in targets:
+            n.start_ms = max(0, n.start_ms + direction * eighth_ms)
+        direction_label = "forward" if direction > 0 else "back"
+        self.piano_roll.notesChanged.emit()
+        self.piano_roll.update()
+        self.log(f"⏱ Shifted {label} {direction_label} ⅛ beat ({direction * eighth_ms:+.0f} ms)")
+
+    def _delete_targets(self):
+        """Delete target notes."""
+        targets, label = self._get_target_notes()
+        if not targets:
+            return
+        self.piano_roll.pushUndo()
+        for n in targets:
+            n.deleted = True
+            n.selected = False
+        self.piano_roll.notesChanged.emit()
+        self.piano_roll.update()
+        self.log(f"Deleted {label}")
 
     def _set_track_simplify(self, track_idx, enabled):
         """Toggle simplify on a track. Clears manual overrides when disabling."""
@@ -3354,10 +3940,63 @@ class MainWindow(QMainWindow):
         self.piano_roll.updateSimplifiedNotes()
         self.piano_roll.update()
         if track_idx is not None and track_idx < len(self._pr_tracks):
-            melody_hidden = sum(1 for n in self._pr_notes if n.simplified and n.track != track_idx)
-            self.log(f"♪ Melody track: {self._pr_tracks[track_idx]['name']} ({melody_hidden} lower-octave duplicates hidden)")
+            self.log(f"♪ Melody track: {self._pr_tracks[track_idx]['name']}")
         else:
             self.log("♪ Melody track cleared")
+
+    def _set_track_preserve(self, track_idx, enabled):
+        """Toggle preserve flag on a track (exempt from debass/simplify/muting)."""
+        if track_idx >= len(self._pr_tracks):
+            return
+        self._pr_tracks[track_idx]['preserve'] = enabled
+        self._populate_track_list()
+        self.piano_roll.update()
+        name = self._pr_tracks[track_idx]['name']
+        if enabled:
+            self.log(f"♫ Preserve: {name}")
+        else:
+            self.log(f"♫ Preserve cleared: {name}")
+
+    def _set_track_debass(self, track_idx, enabled):
+        """Toggle bass duplicate removal on a track (relative to the melody track)."""
+        if track_idx >= len(self._pr_tracks):
+            return
+        self._pr_tracks[track_idx]['debass'] = enabled
+        if not enabled:
+            for n in self._pr_notes:
+                if n.track == track_idx:
+                    n.simplified_manual = None
+        self._populate_track_list()
+        self.piano_roll.updateSimplifiedNotes()
+        self.piano_roll.update()
+        name = self._pr_tracks[track_idx]['name']
+        if enabled:
+            count = sum(1 for n in self._pr_notes if n.simplified and n.track == track_idx)
+            self.log(f"🔇 Bass removal {name}: {count} lower-octave duplicates hidden")
+        else:
+            self.log(f"🔇 Bass removal cleared: {name}")
+
+    def _shift_track_time(self, track_idx, direction):
+        """Shift a track's time offset by ⅛ beat. direction: +1 forward, -1 back, 0 reset."""
+        if track_idx >= len(self._pr_tracks):
+            return
+        bpm = self.piano_roll._bpm or 120
+        eighth_ms = (60000.0 / bpm) / 2  # ⅛ beat in ms
+        t = self._pr_tracks[track_idx]
+        if direction == 0:
+            t['time_offset_ms'] = 0
+        else:
+            t['time_offset_ms'] = t.get('time_offset_ms', 0) + direction * eighth_ms
+        self._populate_track_list()
+        self.piano_roll.updateSimplifiedNotes()
+        self.piano_roll.update()
+        self._minimap.update()
+        offset = t['time_offset_ms']
+        if offset == 0:
+            self.log(f"⏱ Time shift reset: {t['name']}")
+        else:
+            beats = offset / eighth_ms
+            self.log(f"⏱ Time shift {t['name']}: {beats:+.0f}/8 beat ({offset:+.0f} ms)")
 
     def _clamp_to_octave(self, base_pitch):
         """Clamp selected notes (or selected track's notes) into a single octave starting at base_pitch."""
@@ -4077,7 +4716,7 @@ class MainWindow(QMainWindow):
             self._playback_paused_at = 0
             self._playback_sound = None
             self.playback_slider.setValue(0)
-            self.playback_time_label.setText("0:00 / 0:00")
+            self._update_time_label()
             self.piano_roll.setCursorMs(-1)
             self._update_play_btn_text()
 
@@ -4136,6 +4775,7 @@ class MainWindow(QMainWindow):
             return
 
         start_ms = self.piano_roll._scroll_x
+        tsc = self.piano_roll._tempo_scale
 
         # Get all visible notes, then filter to those overlapping or after start_ms
         melody = set(i for i, t in enumerate(self._pr_tracks) if t.get('melody', False))
@@ -4147,8 +4787,8 @@ class MainWindow(QMainWindow):
             end_ms = n.start_ms + n.duration_ms
             if end_ms <= start_ms:
                 continue  # note ends before our start point
-            adj_start = max(0, n.start_ms - start_ms)
-            adj_dur = n.duration_ms if n.start_ms >= start_ms else end_ms - start_ms
+            adj_start = max(0, n.start_ms - start_ms) * tsc
+            adj_dur = (n.duration_ms if n.start_ms >= start_ms else end_ms - start_ms) * tsc
             active.append((adj_start, adj_dur, n.pitch, n.velocity, n.track in melody))
         active = self.piano_roll._filter_in_range(active)
         active.sort(key=lambda x: x[0])
@@ -4156,7 +4796,7 @@ class MainWindow(QMainWindow):
         if not active:
             return
 
-        self._playback_offset_ms = start_ms
+        self._playback_offset_ms = start_ms * tsc
         self._playback_total_ms = max(a[0] + a[1] for a in active) + 200
 
         self.play_btn.setEnabled(False)
@@ -4200,7 +4840,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.gw2_preview_cb.setEnabled(True)
         self.playback_slider.setValue(0)
-        self.playback_time_label.setText("0:00 / 0:00")
+        self._update_time_label()
         self.piano_roll.setCursorMs(-1)
 
     def _playback_elapsed_ms(self):
@@ -4224,12 +4864,15 @@ class MainWindow(QMainWindow):
         # Update progress
         progress = int(elapsed / self._playback_total_ms * 1000)
         self.playback_slider.setValue(progress)
-        # Update time label
-        es = int(elapsed / 1000)
-        ts = int(self._playback_total_ms / 1000)
+        # Update time label (include offset so "Here" shows real song time)
+        display_ms = elapsed + self._playback_offset_ms
+        total_display_ms = self._playback_total_ms + self._playback_offset_ms
+        es = int(display_ms / 1000)
+        ts = int(total_display_ms / 1000)
         self.playback_time_label.setText(f"{es // 60}:{es % 60:02d} / {ts // 60}:{ts % 60:02d}")
         # Update piano roll cursor (offset to match original timeline position)
-        self.piano_roll.setCursorMs(elapsed + self._playback_offset_ms)
+        ts = self.piano_roll._tempo_scale
+        self.piano_roll.setCursorMs((elapsed + self._playback_offset_ms) / ts if ts != 1.0 else elapsed + self._playback_offset_ms)
         self.piano_roll.ensureCursorVisible()
         self._minimap.update()
 
@@ -4324,6 +4967,18 @@ class MainWindow(QMainWindow):
         self.piano_roll.update()
         self._minimap.update()
 
+    def _update_time_label(self):
+        """Update the time label to show current viewport position / total duration."""
+        if self._playback_playing:
+            return  # During playback, the playback timer handles the label
+        pr = self.piano_roll
+        scale = pr._tempo_scale
+        current_ms = pr._scroll_x * scale
+        total_ms = pr._total_ms * scale
+        cs = int(current_ms / 1000)
+        ts = int(total_ms / 1000)
+        self.playback_time_label.setText(f"{cs // 60}:{cs % 60:02d} / {ts // 60}:{ts % 60:02d}")
+
     def _seek_to_ms(self, ms):
         """Seek playback to a specific ms position."""
         self.piano_roll.setCursorMs(ms)
@@ -4338,6 +4993,12 @@ class MainWindow(QMainWindow):
             self.piano_roll._snap_ms = 60000.0 / bpm / 4  # snap to 1/16th notes
         else:
             self.piano_roll._snap_ms = 0.0
+
+    def _on_speed_changed(self, value):
+        """Update tempo scale when speed spinbox changes."""
+        self.piano_roll._tempo_scale = 100.0 / value
+        self._update_time_label()
+        self.log(f"Speed: {value}%")
 
     def _set_theme(self, theme):
         app = QApplication.instance()
@@ -4453,6 +5114,515 @@ class MainWindow(QMainWindow):
         self.piano_roll.notesChanged.emit()
         self.piano_roll.update()
         self.log(f"Smart octave: adjusted {total_shifted} notes across {len(self._pr_tracks)} tracks")
+
+    # ── Song Analysis ─────────────────────────────────────────────
+    def _analyse_song(self):
+        """Run comprehensive GW2 playback analysis and show report dialog."""
+        has_melody = any(t.get('melody', False) for t in self._pr_tracks)
+        if not has_melody:
+            # Prompt user to pick melody + preserved tracks before analysing
+            if not self._pr_tracks:
+                return
+            from PyQt6.QtWidgets import QRadioButton, QButtonGroup
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Select Tracks")
+            layout = QVBoxLayout(dlg)
+            layout.addWidget(QLabel("Which track is the melody?"))
+            btn_group = QButtonGroup(dlg)
+            preserve_checks = []
+            for i, t in enumerate(self._pr_tracks):
+                r, g, b = TRACK_COLORS[i % len(TRACK_COLORS)]
+                row = QHBoxLayout()
+                rb = QRadioButton(t['name'])
+                rb.setStyleSheet(f"QRadioButton {{ color: rgb({r},{g},{b}); }}")
+                if i == 0:
+                    rb.setChecked(True)
+                btn_group.addButton(rb, i)
+                row.addWidget(rb)
+                cb = QCheckBox("Preserve")
+                cb.setStyleSheet(f"QCheckBox {{ color: rgb({r},{g},{b}); }}")
+                cb.setChecked(t.get('preserve', False))
+                preserve_checks.append(cb)
+                row.addWidget(cb)
+                layout.addLayout(row)
+            btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            btns.accepted.connect(dlg.accept)
+            btns.rejected.connect(dlg.reject)
+            layout.addWidget(btns)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            mel_idx = btn_group.checkedId()
+            self._set_melody_track(mel_idx)
+            for i, cb in enumerate(preserve_checks):
+                if i != mel_idx:
+                    self._pr_tracks[i]['preserve'] = cb.isChecked()
+                else:
+                    self._pr_tracks[i]['preserve'] = False
+            self._populate_track_list()
+        inst_data = self.instrument_combo.currentData()
+        if not inst_data:
+            return
+        inst_lo, inst_hi = inst_data[2], inst_data[3]
+
+        report = analyze_song(self._pr_notes, self._pr_tracks, inst_lo, inst_hi)
+        if not report:
+            QMessageBox.information(self, "Analysis", "No notes to analyse.")
+            return
+
+        dlg = AnalysisDialog(report, self)
+        dlg.exec()
+        if dlg.auto_fix_accepted:
+            self._auto_fix_song(report)
+
+    def _auto_fix_song(self, report):
+        """Apply suggested fixes from an analysis report.
+
+        Phase 1 – Relative-positioning octave shifts:
+          • Melody is shifted first (up only, never down unless entirely above range).
+          • Non-melody tracks are then shifted to preserve their original pitch
+            offset from melody while minimizing out-of-range notes.  If a non-melody
+            track would land in the same GW2 octave as melody, it prefers going down.
+        Phase 2 – Remaining fixes:
+          • Non-melody: clamp, debass, simplify.
+          • All tracks: timing trim.
+        """
+        self.piano_roll.pushUndo()
+        inst_data = self.instrument_combo.currentData()
+        if not inst_data:
+            return
+        inst_lo, inst_hi = inst_data[2], inst_data[3]
+        base_pitch = inst_lo + 12
+
+        fix_log = []
+
+        def _median_pitch(notes_list):
+            pitches = sorted(n.pitch for n in notes_list)
+            return pitches[len(pitches) // 2] if pitches else None
+
+        def _best_shift_oor(tnotes, shift_range):
+            """Find the shift in shift_range that minimizes OOR notes."""
+            best_s, best_o = 0, len(tnotes)
+            for s in shift_range:
+                o = sum(1 for n in tnotes
+                        if (n.pitch + s) < inst_lo or (n.pitch + s) > inst_hi)
+                if o < best_o:
+                    best_o = o
+                    best_s = s
+            return best_s, best_o
+
+        # ── Phase 1: Octave shifts with relative positioning ──────
+
+        # Snapshot original median pitches before any shifts
+        orig_medians = {}  # tidx → median pitch
+        for tr in report['tracks']:
+            tnotes = [n for n in self._pr_notes
+                      if n.track == tr['index'] and not n.deleted and not n.simplified]
+            m = _median_pitch(tnotes)
+            if m is not None:
+                orig_medians[tr['index']] = m
+
+        # 1a. Shift melody track first.
+        # Factor in cross-octave cost: shifting melody to a different GW2
+        # octave from accompaniment doubles octave switches in the AHK output.
+        # Score each candidate shift as: OOR_notes + cross_octave_notes * 0.3
+        melody_shift = 0
+        melody_tidx = None
+        for tr in report['tracks']:
+            if not tr['is_melody']:
+                continue
+            melody_tidx = tr['index']
+            if 'smart_octave' not in tr['fixes']:
+                break
+            tnotes = [n for n in self._pr_notes
+                      if n.track == melody_tidx and not n.deleted and not n.simplified]
+            if not tnotes:
+                break
+
+            # Collect non-melody notes for cross-octave estimation
+            non_mel_notes = [n for n in self._pr_notes
+                             if n.track != melody_tidx and not n.deleted
+                             and not n.simplified]
+
+            best_shift = 0
+            best_score = float('inf')
+            for shift in range(-48, 49, 12):
+                # Only allow downward shift if ALL notes are above range
+                if shift < 0 and not all(n.pitch > inst_hi for n in tnotes):
+                    continue
+                oor = sum(1 for n in tnotes
+                          if (n.pitch + shift) < inst_lo or (n.pitch + shift) > inst_hi)
+                # Estimate cross-octave cost: how many non-melody notes
+                # would be in a different GW2 octave from the shifted melody
+                mel_median = _median_pitch(tnotes)
+                if mel_median is not None and non_mel_notes:
+                    mel_oct = _note_octave(mel_median + shift, base_pitch)
+                    cross = sum(1 for n in non_mel_notes
+                                if _note_octave(n.pitch, base_pitch) != mel_oct)
+                else:
+                    cross = 0
+                score = oor + cross * 0.3
+                # Among equal scores, prefer higher position
+                if score < best_score or (score == best_score and shift > best_shift):
+                    best_score = score
+                    best_shift = shift
+            if best_shift != 0:
+                for n in tnotes:
+                    n.pitch += best_shift
+                melody_shift = best_shift
+                direction = "up" if best_shift > 0 else "down"
+                fix_log.append(f"  {tr['name']}: shifted {abs(best_shift)//12} octave(s) {direction}")
+            break
+
+        melody_median_new = None
+        if melody_tidx is not None and melody_tidx in orig_medians:
+            melody_median_new = orig_medians[melody_tidx] + melody_shift
+
+        # 1b. Shift non-melody tracks preserving relative position to melody.
+        # The original arrangement is more important than minimising OOR —
+        # accompaniment should stay below melody even if some notes go OOR.
+        for tr in report['tracks']:
+            if tr['is_melody'] or 'smart_octave' not in tr['fixes']:
+                continue
+            tidx = tr['index']
+            name = tr['name']
+            tnotes = [n for n in self._pr_notes
+                      if n.track == tidx and not n.deleted and not n.simplified]
+            if not tnotes:
+                continue
+
+            track_median = orig_medians.get(tidx)
+            if track_median is None:
+                continue
+
+            # Compute ideal shift: preserve original offset from melody
+            if melody_median_new is not None and melody_tidx in orig_medians:
+                orig_offset = track_median - orig_medians[melody_tidx]
+                target_median = melody_median_new + orig_offset
+                ideal_shift = round((target_median - track_median) / 12) * 12
+            else:
+                ideal_shift = 0
+
+            # Use the ideal shift if it keeps at least half the notes in range.
+            # Only fall back to nearby alternatives if ideal is really bad.
+            def _oor(shift):
+                return sum(1 for n in tnotes
+                           if (n.pitch + shift) < inst_lo or (n.pitch + shift) > inst_hi)
+
+            ideal_oor = _oor(ideal_shift)
+            best_shift = ideal_shift
+
+            if ideal_oor > len(tnotes) * 0.5:
+                # Ideal is too lossy — try nearby shifts, prefer closest to ideal
+                for delta in [12, -12, 24, -24, 36, -36, 48, -48]:
+                    alt = ideal_shift + delta
+                    if -48 <= alt <= 48:
+                        alt_oor = _oor(alt)
+                        if alt_oor < ideal_oor:
+                            best_shift = alt
+                            ideal_oor = alt_oor
+                            if ideal_oor <= len(tnotes) * 0.5:
+                                break
+
+            if best_shift != 0:
+                for n in tnotes:
+                    n.pitch += best_shift
+                direction = "up" if best_shift > 0 else "down"
+                oor_count = _oor(0)  # OOR after shift (shift already applied)
+                oor_note = f" ({sum(1 for n in tnotes if n.pitch < inst_lo or n.pitch > inst_hi)} OOR)" if any(n.pitch < inst_lo or n.pitch > inst_hi for n in tnotes) else ""
+                fix_log.append(f"  {name}: shifted {abs(best_shift)//12} octave(s) {direction}{oor_note}")
+
+        # ── Phase 1.5: Harmonic substitution for OOR melody notes ──
+        # For melody notes just above range (1-12 semitones over inst_hi),
+        # drop one octave and add a perfect fifth to imply the brightness
+        # of the original pitch.  Both notes must fit in range and same
+        # GW2 octave.
+        if melody_tidx is not None:
+            mel_oor = [n for n in self._pr_notes
+                       if n.track == melody_tidx and not n.deleted
+                       and not n.simplified
+                       and n.pitch > inst_hi
+                       and n.pitch <= inst_hi + 12]
+            CHORD_WIN_HS = 5  # ms tolerance for simultaneous
+            harm_count = 0
+            new_notes = []
+            for n in mel_oor:
+                dropped = n.pitch - 12
+                fifth = dropped + 7
+                if dropped < inst_lo or fifth > inst_hi:
+                    continue
+                # Both must be in the same GW2 octave
+                if _note_octave(dropped, base_pitch) != _note_octave(fifth, base_pitch):
+                    continue
+                # Check chord density — don't exceed 4 simultaneous notes
+                sim = sum(1 for x in self._pr_notes
+                          if abs(x.start_ms - n.start_ms) <= CHORD_WIN_HS
+                          and not x.deleted and not x.simplified and x is not n)
+                if sim >= 3:  # adding 2 notes (dropped + fifth) to 3 existing = 5, too many
+                    continue
+                # Replace original with dropped pitch, add fifth as new note
+                n.pitch = dropped
+                harm_note = PianoRollNote(n.start_ms, n.duration_ms, fifth,
+                                          n.velocity, n.track)
+                new_notes.append(harm_note)
+                harm_count += 1
+            if new_notes:
+                self._pr_notes.extend(new_notes)
+            if harm_count:
+                fix_log.append(f"  Melody: {harm_count} notes substituted (octave down + fifth)")
+
+        # ── Phase 1.75: Octave consolidation for rapid melody runs ──
+        # When melody rapidly alternates between two GW2 octaves, snap
+        # minority notes into the dominant octave of the run.  This
+        # eliminates unnecessary octave switching in fast passages.
+        CONSOLIDATE_WIN_MS = 1500  # sliding window for run detection
+        CONSOLIDATE_MIN_NOTES = 4  # minimum notes to consider a "run"
+        CONSOLIDATE_MIN_CROSSINGS = 2  # min octave crossings to trigger
+        if melody_tidx is not None:
+            mel_notes_sorted = sorted(
+                [n for n in self._pr_notes
+                 if n.track == melody_tidx and not n.deleted and not n.simplified],
+                key=lambda n: n.start_ms)
+            consolidated = 0
+            i = 0
+            while i < len(mel_notes_sorted):
+                # Find the end of a window starting at note i
+                j = i + 1
+                while j < len(mel_notes_sorted) and mel_notes_sorted[j].start_ms - mel_notes_sorted[i].start_ms <= CONSOLIDATE_WIN_MS:
+                    j += 1
+                run = mel_notes_sorted[i:j]
+                if len(run) >= CONSOLIDATE_MIN_NOTES:
+                    # Count octave crossings in this run
+                    octs = [_note_octave(n.pitch, base_pitch) for n in run]
+                    crossings = sum(1 for k in range(1, len(octs)) if octs[k] != octs[k - 1])
+                    if crossings >= CONSOLIDATE_MIN_CROSSINGS:
+                        # Find dominant octave
+                        oct_counts = Counter(octs)
+                        dominant_oct = oct_counts.most_common(1)[0][0]
+                        # Snap minority notes into dominant octave
+                        for n in run:
+                            n_oct = _note_octave(n.pitch, base_pitch)
+                            if n_oct != dominant_oct:
+                                if n_oct < dominant_oct:
+                                    new_pitch = n.pitch + 12
+                                else:
+                                    new_pitch = n.pitch - 12
+                                # Only snap if the new pitch is in instrument range
+                                if inst_lo <= new_pitch <= inst_hi:
+                                    n.pitch = new_pitch
+                                    consolidated += 1
+                    i = j  # skip past this run
+                else:
+                    i += 1
+            if consolidated:
+                fix_log.append(f"  Melody: {consolidated} notes consolidated into dominant octave")
+
+        # ── Phase 1.9: Cross-octave accompaniment cleanup ─────────
+        # Accompaniment notes in a different GW2 octave than simultaneous
+        # melody notes force an octave switch that can confuse the player.
+        # Try to shift them into the melody's octave; delete if impossible.
+        CHORD_WIN_XO = 5  # ms tolerance for "simultaneous"
+        if melody_tidx is not None:
+            mel_sorted_xo = sorted(
+                [n for n in self._pr_notes
+                 if n.track == melody_tidx and not n.deleted and not n.simplified],
+                key=lambda n: n.start_ms)
+            mel_starts_xo = [n.start_ms for n in mel_sorted_xo]
+            # Build a lookup: for a given time, what GW2 octave is the melody in?
+            # If multiple melody notes at same time, use the most common octave.
+            shifted_xo = 0
+            simplified_xo = 0
+            non_mel = sorted(
+                [n for n in self._pr_notes
+                 if n.track != melody_tidx and not n.deleted and not n.simplified],
+                key=lambda n: n.start_ms)
+            mi_xo = 0
+            for n in non_mel:
+                # Find melody notes simultaneous with this note
+                while mi_xo < len(mel_starts_xo) - 1 and mel_starts_xo[mi_xo] < n.start_ms - CHORD_WIN_XO:
+                    mi_xo += 1
+                mel_octs = []
+                for k in range(max(0, mi_xo - 1), min(len(mel_sorted_xo), mi_xo + 3)):
+                    if abs(mel_sorted_xo[k].start_ms - n.start_ms) <= CHORD_WIN_XO:
+                        mel_octs.append(_note_octave(mel_sorted_xo[k].pitch, base_pitch))
+                if not mel_octs:
+                    continue
+                mel_oct = max(set(mel_octs), key=mel_octs.count)
+                n_oct = _note_octave(n.pitch, base_pitch)
+                if n_oct == mel_oct:
+                    continue
+                # Try shifting ±12 to match melody octave
+                fixed = False
+                for delta in (12, -12, 24, -24):
+                    new_pitch = n.pitch + delta
+                    if inst_lo <= new_pitch <= inst_hi and _note_octave(new_pitch, base_pitch) == mel_oct:
+                        n.pitch = new_pitch
+                        shifted_xo += 1
+                        fixed = True
+                        break
+                if not fixed:
+                    is_preserved = self._pr_tracks[n.track].get('preserve', False)
+                    if not is_preserved:
+                        n.simplified = True
+                        simplified_xo += 1
+            if shifted_xo or simplified_xo:
+                parts = []
+                if shifted_xo:
+                    parts.append(f"{shifted_xo} shifted")
+                if simplified_xo:
+                    parts.append(f"{simplified_xo} simplified")
+                fix_log.append(f"  Cross-octave cleanup: {', '.join(parts)}")
+
+        # ── Phase 2: Remaining fixes ──────────────────────────────
+
+        for tr in report['tracks']:
+            tidx = tr['index']
+            is_mel = tr['is_melody']
+            fixes = tr['fixes']
+            name = tr['name']
+
+            # Clamp remaining out-of-range — non-melody (incl. preserved)
+            if 'clamp' in fixes and not is_mel:
+                tnotes = [n for n in self._pr_notes
+                          if n.track == tidx and not n.deleted and not n.simplified]
+                count = 0
+                for n in tnotes:
+                    if n.pitch < inst_lo:
+                        n.pitch = inst_lo + (n.pitch % 12)
+                        if n.pitch < inst_lo:
+                            n.pitch += 12
+                        count += 1
+                    elif n.pitch > inst_hi:
+                        target = inst_lo + (n.pitch % 12)
+                        while target + 12 <= inst_hi:
+                            target += 12
+                        n.pitch = target
+                        count += 1
+                if count:
+                    fix_log.append(f"  {name}: clamped {count} out-of-range notes")
+
+            # Bass duplicate removal — non-melody, non-preserved only
+            is_preserved = self._pr_tracks[tidx].get('preserve', False)
+            if 'debass' in fixes and not is_mel and not is_preserved:
+                if not self._pr_tracks[tidx].get('debass', False):
+                    self._pr_tracks[tidx]['debass'] = True
+                    fix_log.append(f"  {name}: enabled bass removal")
+
+            # Simplify — non-melody, non-preserved only
+            if 'simplify' in fixes and not is_mel and not is_preserved:
+                if not self._pr_tracks[tidx].get('simplify', False):
+                    self._pr_tracks[tidx]['simplify'] = True
+                    fix_log.append(f"  {name}: enabled simplify")
+
+        # ── Phase 2.5: Density-adaptive thinning ─────────────────
+        # Dynamically adjust the max chord size at each beat based on
+        # local melody density.  Sparse melody → rich chords allowed.
+        # Dense melody → accompaniment thinned or muted.
+        # Priority: melody > preserved > other accompaniment.
+        DENSITY_HALF_WIN = 500  # ms half-window for melody density
+        CHORD_WIN_THIN = 5     # ms tolerance for "simultaneous"
+        if melody_tidx is not None:
+            protected_tracks = set()
+            protected_tracks.add(melody_tidx)
+            for t in self._pr_tracks:
+                if t.get('preserve', False):
+                    protected_tracks.add(t['index'])
+
+            # Build sorted melody start times + pitches for density lookup
+            mel_sorted = sorted(
+                [(n.start_ms, n.pitch) for n in self._pr_notes
+                 if n.track == melody_tidx and not n.deleted and not n.simplified],
+                key=lambda x: x[0])
+            mel_starts = [x[0] for x in mel_sorted]
+            mel_pitches = [x[1] for x in mel_sorted]
+
+            def _local_max_chord(time_ms):
+                """Max chord size based on melody density + octave crossings."""
+                lo = bisect_left(mel_starts, time_ms - DENSITY_HALF_WIN)
+                hi = bisect_right(mel_starts, time_ms + DENSITY_HALF_WIN)
+                note_count = hi - lo
+                # Count octave transitions in window — each costs ~60ms overhead
+                oct_changes = 0
+                for k in range(lo + 1, hi):
+                    if _note_octave(mel_pitches[k], base_pitch) != _note_octave(mel_pitches[k - 1], base_pitch):
+                        oct_changes += 1
+                effective_density = note_count + oct_changes
+                if effective_density <= 2:
+                    return 4  # sparse: full chords
+                elif effective_density <= 5:
+                    return 3  # moderate: slightly thinner
+                else:
+                    return 1  # dense/cross-octave: melody only
+
+            # Group active notes by beat time
+            active = [n for n in self._pr_notes
+                      if not n.deleted and not n.simplified]
+            active.sort(key=lambda n: n.start_ms)
+            muted_count = 0
+            i = 0
+            while i < len(active):
+                # Collect simultaneous notes
+                group = [active[i]]
+                j = i + 1
+                while j < len(active) and active[j].start_ms - active[i].start_ms <= CHORD_WIN_THIN:
+                    group.append(active[j])
+                    j += 1
+                max_chord = _local_max_chord(active[i].start_ms)
+                if len(group) > max_chord:
+                    # Sort: melody first, then preserved, then others
+                    def _priority(n):
+                        if n.track == melody_tidx:
+                            return 0
+                        if n.track in protected_tracks:
+                            return 1
+                        return 2
+                    group.sort(key=lambda n: (_priority(n), -n.pitch))
+                    # Delete excess notes (lowest priority first, from end)
+                    for n in group[max_chord:]:
+                        if n.track not in protected_tracks:
+                            n.deleted = True
+                            muted_count += 1
+                i = j
+            if muted_count:
+                fix_log.append(f"  Thinned {muted_count} accompaniment notes (density-adaptive)")
+
+        for tr in report['tracks']:
+            tidx = tr['index']
+            is_mel = tr['is_melody']
+            fixes = tr['fixes']
+            name = tr['name']
+
+            # Timing fixes — safe for all tracks including melody
+            if 'timing' in fixes:
+                tnotes = sorted(
+                    [n for n in self._pr_notes
+                     if n.track == tidx and not n.deleted and not n.simplified],
+                    key=lambda n: n.start_ms)
+                count = 0
+                for i in range(len(tnotes) - 1):
+                    gap = tnotes[i + 1].start_ms - (tnotes[i].start_ms + tnotes[i].duration_ms)
+                    co = _note_octave(tnotes[i].pitch, base_pitch)
+                    no = _note_octave(tnotes[i + 1].pitch, base_pitch)
+                    min_gap = GW2_MIN_NOTE_DELAY_MS + (GW2_OCTAVE_SWAP_DELAY_MS if co != no else 0)
+                    if 0 <= gap < min_gap:
+                        new_dur = tnotes[i + 1].start_ms - tnotes[i].start_ms - min_gap
+                        if new_dur < 10:
+                            new_dur = 10
+                        if new_dur != tnotes[i].duration_ms:
+                            tnotes[i].duration_ms = new_dur
+                            count += 1
+                if count:
+                    fix_log.append(f"  {name}: adjusted timing on {count} notes")
+
+        # Update UI
+        self._populate_track_list()
+        self.piano_roll.updateSimplifiedNotes()
+        self.piano_roll.notesChanged.emit()
+        self.piano_roll.update()
+
+        if fix_log:
+            self.log("Auto-fix applied:\n" + "\n".join(fix_log))
+        else:
+            self.log("Auto-fix: no changes needed")
 
     # ── Tools: note operations ────────────────────────────────────
     def _remove_duplicates(self):

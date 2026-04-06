@@ -37,10 +37,15 @@ The piano roll is the main editing area where you interact with notes visually. 
 - **Click and drag** horizontally to set the note's duration while drawing
 - Click **⬚ Select** or press Ctrl+D again to return to select mode
 
+## Context Menu
+
+- **Right-click** a note to open the context menu with options like delete, octave shift, etc.
+- If no notes are currently selected, right-clicking a note **automatically selects it** first, so the context menu operates on the clicked note
+
 ## Deleting Notes
 
 - Select notes and press **Del** to delete them
-- Or right-click a note to delete it
+- Or right-click a note and choose Delete
 
 ## Copy & Paste
 

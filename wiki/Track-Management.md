@@ -22,6 +22,7 @@ Right-click any track to access track tools:
 | **Split by Pitch** | Split a track into two based on pitch (useful for separating treble and bass from a single-track MIDI) |
 | **Merge Checked Tracks** | Combine all checked tracks into one |
 | **♪ Set as Melody** | Mark this track as the melody track (shown with ♪ prefix) |
+| **♫ Preserve Track** | Protect this track from destructive auto-fix passes (debass, simplify, thinning) — see [Analyse & Auto-Fix](Analyse-and-Auto-Fix#preserve-track) |
 | **✂ Simplify (treble + bass)** | Enable chord simplification for this track — see [Chord Simplification](Chord-Simplification) |
 | **Select All Notes** | Select every note in this track |
 | **Delete Track Notes** | Delete all notes in this track |
@@ -38,6 +39,12 @@ When a melody track is set, the converter automatically detects notes on other t
 These lower-octave duplicates are hidden (marked as simplified) because they muddy the melody without adding harmonic value. Fill notes with *different* pitch classes are preserved, keeping the arrangement rich while letting the melody cut through.
 
 The log shows how many duplicates were hidden when you set a melody track. You can use **Ctrl+Shift+Click** on any hidden note to manually override the decision (same as chord simplification overrides).
+
+## Preserve Track
+
+Tracks marked as **Preserve** (♫ prefix in the track list) are protected from destructive auto-fix operations — bass duplicate removal, chord simplification, and density-adaptive thinning will skip these tracks. They still receive octave shifts, clamping, and timing fixes.
+
+This is useful for accompaniment tracks with important counter-melodies or harmonies that you want to keep intact when running [Analyse & Auto-Fix](Analyse-and-Auto-Fix). Toggle it from the track context menu or from the Analyse dialog when selecting tracks.
 
 ## Track Colors
 

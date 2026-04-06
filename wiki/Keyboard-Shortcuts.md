@@ -47,7 +47,7 @@
 | Click empty area + drag | Box select |
 | Click ruler + drag | Select time range |
 | Right-click ruler | Trim menu |
-| Right-click note | Delete note |
+| Right-click note | Context menu (auto-selects note if none selected) |
 | Mouse wheel | Scroll vertically |
 | Shift + wheel | Scroll horizontally |
 | Ctrl + wheel | Zoom in/out |

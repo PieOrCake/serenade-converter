@@ -13,6 +13,8 @@ A GUI tool for converting MIDI files to AHK (AutoHotkey) scripts compatible with
 - **Per-track simplification** — reduce chord complexity by keeping only treble + bass notes (✂)
 - **GW2 instrument mapping** — supports all GW2 instruments (Harp, Lute, Horn, Bell, Flute, Bass, etc.)
 - **Chord mode** — detects major/minor triads and substitutes GW2 chord keypresses
+- **Analyse & Auto-fix** — one-click analysis detects octave issues, dense chords, timing problems; auto-fix with melody-priority octave shifting, harmonic substitution, octave consolidation, cross-octave cleanup, and density-adaptive thinning
+- **Preserve track** — protect important accompaniment tracks from destructive auto-fix passes
 - **Smart octave detection** — auto-transpose minimizes octave changes; optional octave smoothing
 - **Octave settle delays** — 60ms per-step delays in AHK output for reliable GW2 octave switching
 - **Audio preview** — Play, Play Here, Stop, and loop controls with synthesized playback
@@ -50,6 +52,7 @@ See the [Wiki](https://github.com/PieOrCake/serenade-converter/wiki) for the ful
 - [Getting Started](https://github.com/PieOrCake/serenade-converter/wiki/Getting-Started)
 - [Piano Roll Editing](https://github.com/PieOrCake/serenade-converter/wiki/Piano-Roll-Editing)
 - [Track Management](https://github.com/PieOrCake/serenade-converter/wiki/Track-Management)
+- [Analyse & Auto-Fix](https://github.com/PieOrCake/serenade-converter/wiki/Analyse-and-Auto-Fix)
 - [Chord Simplification](https://github.com/PieOrCake/serenade-converter/wiki/Chord-Simplification)
 - [Conversion Settings](https://github.com/PieOrCake/serenade-converter/wiki/Conversion-Settings)
 - [Playback](https://github.com/PieOrCake/serenade-converter/wiki/Playback)
